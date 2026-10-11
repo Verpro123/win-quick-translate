@@ -13,6 +13,9 @@
 
 ## 一、最快上手（3 步）
 
+> **还没有 exe？** 去 [Releases](https://github.com/Verpro123/win-quick-translate/releases/latest)
+> 下载 `QuickTranslate.exe`，或者按 [第六节](#六自己构建--二次开发) 自己构建。
+
 1. **双击 `QuickTranslate.exe`**，右下角托盘会出现一个蓝色「译」字图标
 2. **右键托盘图标 → 设置…**，把翻译引擎的密钥填上（见第二节）
 3. 随便找段英文，**选中它，按 `Ctrl + Alt + T`** —— 译文就出来了
