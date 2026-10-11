@@ -123,21 +123,79 @@ QuickTranslate\
 
 ---
 
-## 六、想改代码 / 重新打包
+## 六、自己构建 / 二次开发
+
+### 第 0 步：先确认你的 Python 带 tkinter
 
 ```bash
-# 装依赖（用带 tkinter 的 Python）
+python -c "import tkinter; print(tkinter.TkVersion)"
+```
+
+- 打印出版本号（例如 `8.6`）→ 没问题，继续往下
+- 报 `ModuleNotFoundError: No module named 'tkinter'` → **换一个 Python**
+
+> ⚠️ **这是整个项目最容易卡住的地方，没有之一。**
+> 官网安装的 Python 一定带 tkinter，但**精简版发行版**（某些工具自带的运行时、
+> 嵌入式打包的 Python）经常把它裁掉。用它跑源码会直接崩，打包出来的 exe 同样起不来 ——
+> 而且报错发生在双击 exe 那一刻，很容易误以为是程序写坏了。
+> **所以这条命令请第一个跑，别等打包完才发现。**
+
+### 完整流程
+
+```bash
+# 1) 进入项目目录
+cd win-quick-translate
+
+# 2) 建虚拟环境（可选，但推荐：不动系统里的 Python）
+python -m venv .venv
+.venv\Scripts\activate          # PowerShell 用 .venv\Scripts\Activate.ps1
+
+# 3) 装依赖
 python -m pip install pystray pillow requests keyboard pyinstaller
 
-# 自检环境
+# 4) 自检：8 项全 OK 再往下走；哪项 FAIL 会直接告诉你原因
 python selftest.py
 
-# 重新打包，产物在 dist\QuickTranslate.exe
+# 5) 打包
 python build.py
 ```
 
-> 注意：打包必须用**自带 tkinter** 的 Python（官方安装版都带）。
-> 部分精简版/嵌入式发行版会裁掉 tkinter，那样打出来的 exe 起不来。
+产物：
+
+| 位置 | 说明 |
+|---|---|
+| `dist\QuickTranslate.exe` | 单文件可执行程序 |
+| `QuickTranslate.exe`（项目根目录） | 上面那份的副本，图双击方便 |
+
+体积约 **20 MB**，**内置完整 Python 运行时** —— 拷到别的 Windows 机器上不用装任何东西，双击即用。
+
+### 只想改点东西，不想每次等打包？
+
+直接跑源码，改完存盘、重启程序就生效：
+
+```bash
+python main.py
+```
+
+**调试阶段用这个最省事**，`build.py` 一次要二三十秒。
+
+### 构建相关的坑
+
+**卡在 "Analyzing dependencies" 很久**
+第一次本来就慢（要遍历整棵依赖树）。`build.py` 带了 `--clean`，每次从头构建以保证产物干净；想快可以把那个参数去掉。
+
+**装依赖超时 / SSL 报错**
+换国内镜像：
+```bash
+python -m pip install pystray pillow requests keyboard pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+**打出来的 exe 被杀毒软件拦**
+PyInstaller 的引导程序常被误报（行为特征和某些恶意软件相似），加信任即可。想彻底避开就直接 `python main.py` 跑源码。
+
+**改完代码准备提交时**
+`config.json` 里有你的 API Key，`.gitignore` 已经挡住了它和日志、exe、`dist/`。
+**别用 `git add -f` 强行把它加进去。** 提交前扫一眼 `git status`，看到它出现在列表里就要警觉。
 
 ---
 
