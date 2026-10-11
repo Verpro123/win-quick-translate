@@ -1,0 +1,28 @@
+# ---- 本地配置与日志 ----
+# config.json 里存着翻译引擎的 API Key，绝对不能提交
+config.json
+config.json.tmp
+config.json.broken
+quicktranslate.log
+*.log
+
+# ---- 构建产物 ----
+dist/
+build/
+*.spec
+QuickTranslate.exe
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
