@@ -1,0 +1,58 @@
+name: 构建并发布 Release
+
+# 只在推送版本标签时触发，比如 git push origin v1.0.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write          # 创建 Release 需要这个权限
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          # 用官方完整版 Python（自带 tkinter），这是打包的硬性前提。
+          # 各平台的精简版发行版常把 tkinter 裁掉，打出来的 exe 会起不来。
+          python-version: "3.12"
+
+      - name: 验证 tkinter 可用
+        run: python -c "import tkinter; print('Tk 版本:', tkinter.TkVersion)"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pystray pillow requests keyboard pyinstaller
+
+      - name: 验证依赖能正常导入
+        run: python -c "import pystray, PIL, requests, keyboard; print('依赖导入正常')"
+
+      - name: 打包成单文件 exe
+        run: python build.py
+
+      - name: 确认产物存在
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/QuickTranslate.exe")) {
+            Write-Error "没有找到 dist/QuickTranslate.exe"
+            exit 1
+          }
+          $size = [math]::Round((Get-Item "dist/QuickTranslate.exe").Length / 1MB, 1)
+          Write-Host "产物大小：$size MB"
+
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/QuickTranslate.exe
+          generate_release_notes: true
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
