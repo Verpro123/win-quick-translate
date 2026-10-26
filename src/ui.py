@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""界面：鼠标旁的划词气泡 + 设置窗口。
+"""界面：鼠标旁的划词气泡、划词「翻译」按钮 + 设置窗口。
 
 背景为什么是自己画的
 --------------------
@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import ctypes
 import logging
-import re
 import threading
 import tkinter as tk
 from ctypes import wintypes
@@ -30,6 +29,7 @@ import keyboard
 from PIL import Image, ImageDraw, ImageFilter, ImageGrab, ImageTk
 
 import config as config_mod
+import desktop
 import system
 from engines import TranslationResult, build_engine
 
@@ -78,6 +78,10 @@ GWL_EXSTYLE = -20
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_TOOLWINDOW = 0x00000080
 GA_ROOT = 2
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+WDA_NONE = 0x00000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011   # Win10 2004+：屏幕上照常显示，截屏里不出现
 
 if ctypes.sizeof(ctypes.c_void_p) == 8:
     _GetWindowLong = _user32.GetWindowLongPtrW
@@ -94,14 +98,63 @@ _SetWindowLong.argtypes = [wintypes.HWND, ctypes.c_int, _LONG_PTR]
 _SetWindowLong.restype = _LONG_PTR
 _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 _user32.GetAncestor.restype = wintypes.HWND
+_user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+]
+_user32.SetWindowPos.restype = wintypes.BOOL
+_user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+_user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+
+
+def _root_hwnd(widget: tk.Misc) -> int:
+    raw = widget.winfo_id()
+    return int(_user32.GetAncestor(wintypes.HWND(raw), GA_ROOT) or raw)
+
+
+def _hide_from_capture(widget: tk.Misc) -> bool:
+    """让窗口不出现在截屏里，但屏幕上照常显示。
+
+    截背景时必须别拍到气泡自己。以前的做法是先 withdraw 再 deiconify，
+    窗口会消失几十毫秒，肉眼就是"闪一下"。换成截屏排除后，窗口一直留在
+    屏幕上，毛玻璃更新完直接替换，没有闪烁。
+    """
+    try:
+        return bool(
+            _user32.SetWindowDisplayAffinity(
+                wintypes.HWND(_root_hwnd(widget)), WDA_EXCLUDEFROMCAPTURE
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("截屏排除不可用（%s），退回隐藏窗口", exc)
+        return False
+
+
+def _show_in_capture(widget: tk.Misc) -> None:
+    try:
+        _user32.SetWindowDisplayAffinity(wintypes.HWND(_root_hwnd(widget)), WDA_NONE)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def place_window(widget: tk.Misc, x: int, y: int, width: int, height: int) -> None:
+    """用 Win32 直接摆窗口。
+
+    不能用 wm geometry：tk 的几何串里 "-1182" 表示「距屏幕右边缘 1182」，
+    而不是负坐标 —— 副屏在主屏左边时，气泡永远摆不过去。
+    """
+    _user32.SetWindowPos(
+        wintypes.HWND(_root_hwnd(widget)), None,
+        x, y, width, height,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    )
 
 
 def _apply_no_activate(widget: tk.Misc) -> None:
     """给窗口打上「不激活」「不进 Alt+Tab」标记。"""
     try:
         widget.update_idletasks()
-        raw = widget.winfo_id()
-        root_hwnd = int(_user32.GetAncestor(wintypes.HWND(raw), GA_ROOT) or raw)
+        root_hwnd = _root_hwnd(widget)
         current = _GetWindowLong(wintypes.HWND(root_hwnd), GWL_EXSTYLE)
         _SetWindowLong(
             wintypes.HWND(root_hwnd),
@@ -110,6 +163,11 @@ def _apply_no_activate(widget: tk.Misc) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         log.debug("设置窗口扩展样式失败（不影响主功能）：%s", exc)
+
+
+def _in_rect(x: int, y: int, rect: tuple[int, int, int, int]) -> bool:
+    rx, ry, rw, rh = rect
+    return rx <= x < rx + rw and ry <= y < ry + rh
 
 
 def _rounded_rect(canvas: tk.Canvas, x1, y1, x2, y2, radius, **kwargs):
@@ -169,6 +227,14 @@ class BubbleWindow:
         self._photo: ImageTk.PhotoImage | None = None   # 必须留引用，否则被回收
         self._photo_key: tuple | None = None
         self._font_cache: dict[tuple, tkfont.Font] = {}
+        # 拖动状态
+        self._dragging = False
+        self._dragged = False
+        self._drag_start: tuple[int, int] | None = None
+        self._drag_offset: tuple[int, int] | None = None
+        # 自己记住窗口位置和尺寸：Win32 摆的窗口，tk 的 winfo 可能慢一拍
+        self._pos: tuple[int, int] | None = None
+        self._size: tuple[int, int] | None = None
 
     # ---- 窗口生命周期 ----
 
@@ -179,7 +245,7 @@ class BubbleWindow:
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)          # 去掉标题栏和边框
         win.attributes("-topmost", True)    # 始终压在最上层
-        win.configure(bg=TRANSPARENT_KEY)
+        win.configure(bg=TRANSPARENT_KEY, cursor="fleur")
         try:
             win.attributes("-transparentcolor", TRANSPARENT_KEY)
         except tk.TclError:
@@ -191,7 +257,9 @@ class BubbleWindow:
 
         _apply_no_activate(win)
 
-        win.bind("<Button-1>", lambda _e: self.hide())
+        win.bind("<ButtonPress-1>", self._on_press)
+        win.bind("<B1-Motion>", self._on_motion)
+        win.bind("<ButtonRelease-1>", self._on_release)
         win.bind("<Enter>", lambda _e: self._cancel_timer())
         win.bind("<Leave>", lambda _e: self._arm_timer())
 
@@ -229,21 +297,30 @@ class BubbleWindow:
         content_w, card_h, painter = self._layout(source, result, is_error, colors, font_size)
         card_w = content_w + self.PAD_X * 2
 
-        # 2) 定位
-        previous = self._current_position(win)
-        if previous is None:
-            x, y = self._place(card_w, card_h)
+        # 2) 定位：每次都贴着鼠标弹，鼠标在哪块屏就出现在哪块屏。
+        #    正拖着的时候结果恰好回来，就留在手底下，别把窗口抢回去。
+        if self._dragging and self._pos is not None:
+            x, y = desktop.clamp_to_work_area(self._pos[0], self._pos[1], card_w, card_h)
         else:
-            x, y = self._clamp(previous[0], previous[1], card_w, card_h)
+            self._dragging = False
+            self._dragged = False
+            self._drag_start = None
+            self._drag_offset = None
+            x, y = self._place(card_w, card_h)
 
-        # 3) 背景：抓屏 -> 模糊 -> 染色 -> 切圆角
+        # 3) 背景：先拍好新底图，再一次性清空重画。
+        #    中间不 update，屏幕上只会看到旧画面直接跳成新画面，没有闪烁。
         canvas.configure(width=card_w, height=card_h)
-        self._paint_backdrop(canvas, x, y, card_w, card_h, colors, win)
+        image = self._backdrop_image(x, y, card_w, card_h, colors, win)
+        canvas.delete("all")
+        self._draw_backdrop(canvas, card_w, card_h, colors, image)
 
         # 4) 铺内容
         painter()
 
-        win.geometry(f"{card_w}x{card_h}+{x}+{y}")
+        self._pos = (x, y)
+        self._size = (card_w, card_h)
+        place_window(win, x, y, card_w, card_h)
         win.deiconify()
         win.lift()
 
@@ -254,52 +331,53 @@ class BubbleWindow:
 
     # ---- 背景：自绘毛玻璃 ----
 
-    def _paint_backdrop(
-        self, canvas: tk.Canvas, x: int, y: int, width: int, height: int,
-        colors: dict, win: tk.Toplevel,
-    ) -> None:
-        """抓窗口背后的屏幕内容，模糊压暗后当卡片底；失败就退回纯色。"""
-        mode = str(self.cfg.get("backdrop", "blur")).lower()
+    def _backdrop_image(
+        self, x: int, y: int, width: int, height: int, colors: dict, win: tk.Toplevel
+    ) -> ImageTk.PhotoImage | None:
+        """取（或复用）毛玻璃底图；纯色模式或抓屏失败时返回 None。"""
+        if str(self.cfg.get("backdrop", "blur")).lower() != "blur":
+            return None
         key = (x, y, width, height)
+        if self._photo is not None and self._photo_key == key:
+            return self._photo
+        image = self._capture_backdrop(x, y, width, height, colors, win)
+        if image is not None:
+            self._photo = image
+            self._photo_key = key
+        return image
 
-        if mode == "blur":
-            if self._photo is not None and self._photo_key == key:
-                canvas.create_image(0, 0, anchor="nw", image=self._photo)
-                canvas.tag_lower("all")
-                return
-            image = self._capture_backdrop(x, y, width, height, colors, win)
-            if image is not None:
-                self._photo = image
-                self._photo_key = key
-                canvas.create_image(0, 0, anchor="nw", image=image)
-                canvas.tag_lower("all")
-                return
-
-        # 纯色兜底
-        _rounded_rect(
-            canvas, 0, 0, width, height, self.RADIUS,
-            fill=colors["tint"], outline=colors["border"], width=1,
-        )
-        canvas.tag_lower("all")
+    def _draw_backdrop(
+        self, canvas: tk.Canvas, width: int, height: int,
+        colors: dict, image: ImageTk.PhotoImage | None,
+    ) -> None:
+        if image is not None:
+            canvas.create_image(0, 0, anchor="nw", image=image, tags="bg")
+        else:
+            _rounded_rect(
+                canvas, 0, 0, width, height, self.RADIUS,
+                fill=colors["tint"], outline=colors["border"], width=1, tags="bg",
+            )
+        canvas.tag_lower("bg")
 
     def _capture_backdrop(
         self, x: int, y: int, width: int, height: int, colors: dict, win: tk.Toplevel
     ) -> ImageTk.PhotoImage | None:
         """拍下 (x, y) 处 width×height 的屏幕，模糊后切圆角。"""
+        excluded = False
+        withdrawn = False
         try:
-            # 先把气泡藏起来，否则会拍到上一次的自己
+            # 别把气泡自己拍进去。优先"截屏时排除该窗口"，屏幕上不隐藏；
+            # 系统太老不支持时才退回先隐藏、拍完再显示。
             if win.winfo_viewable():
-                win.withdraw()
-                win.update()
+                excluded = _hide_from_capture(win)
+                if not excluded:
+                    win.withdraw()
+                    win.update()
+                    withdrawn = True
 
-            scale = self._dpi_scale()
-            box = (
-                int(x * scale), int(y * scale),
-                int((x + width) * scale), int((y + height) * scale),
-            )
-            snapshot = ImageGrab.grab(bbox=box, all_screens=True)
-            if snapshot.size != (width, height):
-                snapshot = snapshot.resize((width, height), Image.LANCZOS)
+            snapshot = self._grab_region(x, y, width, height)
+            if snapshot is None:
+                return None
 
             blurred = snapshot.convert("RGB").filter(ImageFilter.GaussianBlur(11))
 
@@ -314,17 +392,50 @@ class BubbleWindow:
             card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
             card.paste(blended, (0, 0), mask)
 
-            # 描一圈边，让卡片轮廓立住
+            # 描一圈边，让卡片轮廓立住。
+            # 这里不能用半透明色：layered window 不做 alpha 合成，半透明像素会和
+            # 键控透明色混成一圈粉边。
             ImageDraw.Draw(card).rounded_rectangle(
                 [0, 0, width - 1, height - 1],
                 radius=self.RADIUS,
-                outline=self._rgba(colors["border"], 160),
+                outline=self._rgba(colors["border"], 255),
                 width=1,
             )
             return ImageTk.PhotoImage(card)
         except Exception as exc:  # noqa: BLE001
             log.warning("背景模糊失败，退回纯色：%s", exc)
             return None
+        finally:
+            if excluded:
+                _show_in_capture(win)
+            elif withdrawn:
+                win.deiconify()
+
+    @staticmethod
+    def _grab_region(x: int, y: int, width: int, height: int) -> Image.Image | None:
+        """按虚拟屏幕坐标抓一块图，兼容副屏在主屏左边（负坐标）和缩放比例。
+
+        整屏拍完再裁，是因为 tkinter 的坐标、Windows 的虚拟屏幕原点、
+        GDI 截图的像素尺寸在缩放环境下不一定一一对应 —— 用实际截图的
+        尺寸反推比例，比猜 DPI 可靠。
+        """
+        left, top, virtual_w, virtual_h = desktop.virtual_screen()
+        if virtual_w <= 0 or virtual_h <= 0:
+            return None
+
+        shot = ImageGrab.grab(all_screens=True)
+        scale_x = shot.width / virtual_w
+        scale_y = shot.height / virtual_h
+        box = (
+            round((x - left) * scale_x),
+            round((y - top) * scale_y),
+            round((x - left + width) * scale_x),
+            round((y - top + height) * scale_y),
+        )
+        region = shot.crop(box)
+        if region.size != (width, height):
+            region = region.resize((width, height), Image.LANCZOS)
+        return region
 
     @staticmethod
     def _rgba(hex_color: str, alpha: int) -> tuple[int, int, int, int]:
@@ -332,17 +443,6 @@ class BubbleWindow:
         if len(text) != 6:
             text = "3C4048"
         return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16), alpha)
-
-    def _dpi_scale(self) -> float:
-        """物理像素 / 逻辑像素。抓屏用物理像素，tkinter 用逻辑像素。"""
-        try:
-            physical = int(_user32.GetSystemMetrics(0))
-            logical = int(self.root.winfo_screenwidth())
-            if logical > 0 and physical > 0:
-                return physical / logical
-        except Exception:  # noqa: BLE001
-            pass
-        return 1.0
 
     # ---- 内容排版 ----
 
@@ -473,51 +573,277 @@ class BubbleWindow:
 
     # ---- 定位 ----
 
-    def _current_position(self, win: tk.Toplevel) -> tuple[int, int] | None:
-        """窗口当下可见就返回它现在的左上角坐标，否则返回 None。"""
-        try:
-            if win.state() != "normal" or not win.winfo_viewable():
-                return None
-            match = re.match(r"\d+x\d+\+(-?\d+)\+(-?\d+)", win.geometry())
-            if not match:
-                return None
-            return int(match.group(1)), int(match.group(2))
-        except (tk.TclError, ValueError):
-            return None
-
     def _place(self, width: int, height: int) -> tuple[int, int]:
-        """定位到鼠标右下角；贴边就翻到另一侧，别跑出屏幕。"""
-        assert self._win is not None
-        screen_w = self._win.winfo_screenwidth()
-        screen_h = self._win.winfo_screenheight()
+        """定位到鼠标右下角；贴边就翻到另一侧，且只在鼠标那块屏里活动。"""
+        mouse_x, mouse_y = desktop.cursor_pos()
+        left, top, right, bottom = desktop.monitor_work_area(mouse_x, mouse_y)
 
-        mouse_x, mouse_y = self.root.winfo_pointerxy()
         x = mouse_x + 18
         y = mouse_y + 22
 
-        if x + width > screen_w - 8:
+        if x + width > right - 8:
             x = mouse_x - width - 18
-        if y + height > screen_h - 56:
+        if y + height > bottom - 8:
             y = mouse_y - height - 22
 
-        return self._clamp(x, y, width, height)
-
-    def _clamp(self, x: int, y: int, width: int, height: int) -> tuple[int, int]:
-        assert self._win is not None
-        screen_w = self._win.winfo_screenwidth()
-        screen_h = self._win.winfo_screenheight()
-        x = max(8, min(x, screen_w - width - 8))
-        y = max(8, min(y, screen_h - height - 56))
+        x = max(left + 8, min(x, right - width - 8))
+        y = max(top + 8, min(y, bottom - height - 8))
         return x, y
+
+    # ---- 拖动 ----
+
+    def _on_press(self, event) -> None:
+        self._cancel_timer()
+        self._dragging = True
+        self._dragged = False
+        self._drag_start = (event.x_root, event.y_root)
+        if self._pos is None:
+            return
+        self._drag_offset = (
+            event.x_root - self._pos[0],
+            event.y_root - self._pos[1],
+        )
+
+    def _on_motion(self, event) -> None:
+        win = self._win
+        if win is None or not win.winfo_exists():
+            return
+        if self._drag_start is None or self._drag_offset is None:
+            return
+        if self._size is None:
+            return
+
+        dx = event.x_root - self._drag_start[0]
+        dy = event.y_root - self._drag_start[1]
+        if not self._dragged and abs(dx) + abs(dy) < 4:
+            return  # 只是手抖，别把点击当成拖动
+
+        self._dragged = True
+        width, height = self._size
+        x = event.x_root - self._drag_offset[0]
+        y = event.y_root - self._drag_offset[1]
+        x, y = desktop.clamp_to_work_area(x, y, width, height)
+        self._pos = (x, y)
+        place_window(win, x, y, width, height)
+
+    def _on_release(self, _event) -> None:
+        self._dragging = False
+        self._drag_start = None
+        self._drag_offset = None
+
+        if not self._dragged:
+            self.hide()  # 没挪动就是点击，沿用「点一下关掉」
+            return
+
+        self._dragged = False
+        self._repaint_backdrop()
+        if not self._cursor_inside():
+            self._arm_timer()
+
+    def _cursor_inside(self) -> bool:
+        if self._pos is None or self._size is None:
+            return False
+        x, y = self.root.winfo_pointerxy()
+        return _in_rect(x, y, (*self._pos, *self._size))
+
+    def _repaint_backdrop(self) -> None:
+        """拖动松手后按新位置重新抓屏，否则毛玻璃还是旧位置的画面。"""
+        win, canvas = self._win, self._canvas
+        if win is None or canvas is None or not win.winfo_exists():
+            return
+        if not win.winfo_viewable():
+            return
+        if self._pos is None or self._size is None:
+            return
+        width, height = self._size
+        if width <= 1 or height <= 1:
+            return
+
+        x, y = self._pos
+        colors = GLASS_DARK if system_is_dark() else GLASS_LIGHT
+        self._photo = None
+        self._photo_key = None
+        # 先拍新图（旧背景还在屏幕上，抓屏时窗口会被排除），
+        # 再把背景一次性换掉 —— 不 withdraw，也不留空白帧。
+        image = self._backdrop_image(x, y, width, height, colors, win)
+        canvas.delete("bg")
+        self._draw_backdrop(canvas, width, height, colors, image)
+
+    def hwnd(self) -> int:
+        """窗口句柄；没创建或已销毁时返回 0。"""
+        win = self._win
+        if win is None or not win.winfo_exists():
+            return 0
+        try:
+            return _root_hwnd(win)
+        except tk.TclError:
+            return 0
 
     # ---- 自动收起 ----
 
     def _arm_timer(self) -> None:
+        if self._dragging:
+            return  # 拖动过程中别被自动收起
         self._cancel_timer()
         timeout = float(self.cfg.get("bubble_timeout", 7.0))
         if timeout <= 0:
             return
         self._job = self.root.after(int(timeout * 1000), self.hide)
+
+    def _cancel_timer(self) -> None:
+        if self._job is not None:
+            try:
+                self.root.after_cancel(self._job)
+            except (ValueError, tk.TclError):
+                pass
+            self._job = None
+
+
+# ------------------------------------------------------------ 划词按钮
+
+
+class SelectionPrompt:
+    """划词后贴在鼠标旁的「翻译」小按钮。
+
+    和气泡一样打 WS_EX_NOACTIVATE：点它的时候焦点仍在原程序里，
+    选区没有丢，后台照常发 Ctrl+C 就能把选中的字取回来。
+    """
+
+    WIDTH = 60
+    HEIGHT = 28
+    RADIUS = 14
+    GAP_X = 10
+    GAP_Y = 12
+    TIMEOUT = 2.5
+    BG = "#2563EB"
+    BG_HOVER = "#1D4ED8"
+    BORDER = "#1E3A8A"
+
+    def __init__(self, root: tk.Tk, on_click) -> None:
+        self.root = root
+        self.on_click = on_click
+        self._win: tk.Toplevel | None = None
+        self._canvas: tk.Canvas | None = None
+        self._font: tkfont.Font | None = None
+        self._job: str | None = None
+        self._rect: tuple[int, int, int, int] | None = None
+
+    # ---- 窗口 ----
+
+    def _ensure_window(self) -> tk.Toplevel:
+        if self._win is not None and self._win.winfo_exists():
+            return self._win
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=TRANSPARENT_KEY, cursor="hand2")
+        try:
+            win.attributes("-transparentcolor", TRANSPARENT_KEY)
+        except tk.TclError:
+            log.debug("当前环境不支持键控透明，翻译按钮会退化为直角")
+
+        canvas = tk.Canvas(win, bg=TRANSPARENT_KEY, highlightthickness=0, bd=0)
+        canvas.pack(fill="both", expand=True)
+        _apply_no_activate(win)
+
+        win.bind("<Enter>", lambda _e: self._hover(True))
+        win.bind("<Leave>", lambda _e: self._hover(False))
+        win.bind("<ButtonRelease-1>", self._on_click)
+
+        self._win = win
+        self._canvas = canvas
+        return win
+
+    def show(self, x: int, y: int) -> None:
+        win = self._ensure_window()
+        canvas = self._canvas
+        assert canvas is not None
+
+        self._draw(canvas, hover=False)
+        px, py = self._place(x, y)
+
+        self._rect = (px, py, self.WIDTH, self.HEIGHT)
+        place_window(win, px, py, self.WIDTH, self.HEIGHT)
+        win.deiconify()
+        win.lift()
+        self._arm_timer()
+
+    def hide(self) -> None:
+        self._cancel_timer()
+        if self._win is not None and self._win.winfo_exists():
+            self._win.withdraw()
+
+    def hit(self, x: int, y: int) -> bool:
+        """按最后一次出现的位置判断，按钮刚被收起也算。
+
+        全局鼠标监视和 tkinter 的点击事件是两条线：点按钮时监视线程
+        可能先把按钮收掉，导致这一下点击落空。用位置判断可以避开。
+        """
+        return self._rect is not None and _in_rect(x, y, self._rect)
+
+    def hwnd(self) -> int:
+        win = self._win
+        if win is None or not win.winfo_exists():
+            return 0
+        try:
+            return _root_hwnd(win)
+        except tk.TclError:
+            return 0
+
+    # ---- 绘制与交互 ----
+
+    def _draw(self, canvas: tk.Canvas, hover: bool) -> None:
+        canvas.delete("all")
+        _rounded_rect(
+            canvas, 0, 0, self.WIDTH, self.HEIGHT, self.RADIUS,
+            fill=self.BG_HOVER if hover else self.BG,
+            outline=self.BORDER, width=1,
+        )
+        if self._font is None:
+            self._font = tkfont.Font(family=FONT_CN, size=9, weight="bold")
+        canvas.create_text(
+            self.WIDTH // 2, self.HEIGHT // 2,
+            text="翻译", font=self._font, fill="#FFFFFF",
+        )
+
+    def _hover(self, hover: bool) -> None:
+        canvas = self._canvas
+        win = self._win
+        if canvas is None or win is None or not win.winfo_exists():
+            return
+        if not win.winfo_viewable():
+            return
+        self._draw(canvas, hover)
+        if hover:
+            self._cancel_timer()
+        else:
+            self._arm_timer()
+
+    def _on_click(self, _event) -> None:
+        self.hide()
+        try:
+            self.on_click()
+        except Exception:  # noqa: BLE001
+            log.exception("翻译按钮回调失败")
+
+    def _place(self, x: int, y: int) -> tuple[int, int]:
+        left, top, right, bottom = desktop.monitor_work_area(x, y)
+        px = x + self.GAP_X
+        py = y + self.GAP_Y
+        if px + self.WIDTH > right - 4:
+            px = x - self.WIDTH - self.GAP_X
+        if py + self.HEIGHT > bottom - 4:
+            py = y - self.HEIGHT - self.GAP_Y
+        px = max(left + 4, min(px, right - self.WIDTH - 4))
+        py = max(top + 4, min(py, bottom - self.HEIGHT - 4))
+        return px, py
+
+    # ---- 自动收起 ----
+
+    def _arm_timer(self) -> None:
+        self._cancel_timer()
+        self._job = self.root.after(int(self.TIMEOUT * 1000), self.hide)
 
     def _cancel_timer(self) -> None:
         if self._job is not None:
@@ -583,6 +909,9 @@ class SettingsWindow:
         self.ai_key = tk.StringVar(value=self.cfg["ai"].get("api_key", ""))
         self.timeout_var = tk.DoubleVar(value=float(self.cfg.get("bubble_timeout", 7.0)))
         self.font_var = tk.IntVar(value=int(self.cfg.get("font_size", 11)))
+        self.selection_var = tk.BooleanVar(
+            value=bool(self.cfg.get("selection_button", True))
+        )
         self.autostart_var = tk.BooleanVar(value=bool(self.cfg.get("autostart", False)))
 
         row = 0
@@ -647,6 +976,12 @@ class SettingsWindow:
         ttk.Spinbox(
             bubble_box, from_=8, to=22, width=4, textvariable=self.font_var
         ).pack(side="left", padx=4)
+        row += 1
+
+        ttk.Checkbutton(
+            outer, text="选中文字后，在鼠标旁显示「翻译」小按钮",
+            variable=self.selection_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
         row += 1
 
         ttk.Checkbutton(
@@ -723,6 +1058,7 @@ class SettingsWindow:
         cfg["backdrop"] = self.backdrop_var.get()
         cfg["bubble_timeout"] = float(self.timeout_var.get())
         cfg["font_size"] = int(self.font_var.get())
+        cfg["selection_button"] = bool(self.selection_var.get())
         cfg["autostart"] = bool(self.autostart_var.get())
         cfg["baidu"]["appid"] = self.baidu_appid.get().strip()
         cfg["baidu"]["secret"] = self.baidu_secret.get().strip()
@@ -789,6 +1125,16 @@ class SettingsWindow:
         else:
             color = "#1A7F37"
         self.status_label.configure(text=text, foreground=color)
+
+    def hwnd(self) -> int:
+        """窗口句柄；没打开或已关闭时返回 0。"""
+        win = self.win
+        if win is None or not win.winfo_exists():
+            return 0
+        try:
+            return _root_hwnd(win)
+        except tk.TclError:
+            return 0
 
     def _close(self) -> None:
         if self.win is not None and self.win.winfo_exists():

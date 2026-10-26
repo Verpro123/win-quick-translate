@@ -28,6 +28,7 @@ if (_HERE / "src").is_dir() and str(_HERE / "src") not in sys.path:
 
 import capture  # noqa: E402
 import config as config_mod  # noqa: E402
+import desktop  # noqa: E402
 import engines  # noqa: E402
 import system  # noqa: E402
 import tray as tray_mod  # noqa: E402
@@ -38,13 +39,16 @@ log = logging.getLogger(__name__)
 HELP_TEXT = """使用方法
 
 1. 用鼠标选中任意一段英文（单词、短语、整句都行）
-2. 按下快捷键（默认 ctrl+alt+t，可在设置里改）
-3. 鼠标旁边会弹出译文，几秒钟后自动消失
+2. 松开鼠标，选中的文字旁边会冒出「翻译」小按钮，点一下就能译
+   也可以直接按快捷键（默认 ctrl+alt+t，可在设置里改）
+3. 译文气泡会跟着鼠标弹出，接几块屏都一样
 
 几个小技巧
+· 气泡可以按住拖动，松手后会按新位置重新取背景
 · 点击气泡可以立刻关掉它
 · 鼠标停在气泡上的时候，它不会自动消失
 · 气泡会同时显示原文和译文，方便对照
+· 不想看到划词小按钮，去设置里关掉即可
 
 第一次使用
 · 打开托盘的「设置…」，填上百度翻译的 APPID 与密钥，
@@ -69,9 +73,14 @@ class App:
         self.root.title(config_mod.APP_TITLE)
 
         self.bubble = ui.BubbleWindow(self.root, self.cfg)
+        self.prompt = ui.SelectionPrompt(self.root, lambda: self.submit("translate"))
         self.settings = ui.SettingsWindow(self.root, self.cfg, on_save=self.apply_settings)
         self.hotkeys = system.HotkeyManager(lambda: self.submit("translate"))
         self.tray = tray_mod.TrayIcon(self)
+        self.mouse = desktop.SelectionWatcher(
+            on_select=lambda *pos: self.submit("selection_prompt", pos),
+            on_click=lambda x, y: self.submit("mouse_down", (x, y)),
+        )
 
     # ------------------------------------------------------------ 启动
 
@@ -90,6 +99,7 @@ class App:
             )
 
         threading.Thread(target=self.tray.run, name="tray", daemon=True).start()
+        self.mouse.start()
         self.root.after(60, self._pump)
         self.root.after(2000, self._first_run_check)
         log.info("启动完成，日志位置：%s", config_mod.log_path())
@@ -132,6 +142,12 @@ class App:
         elif action == "bubble":
             source, body, is_error, auto_hide = payload  # type: ignore[misc]
             self.bubble.show(source, body, is_error=is_error, auto_hide=auto_hide)
+        elif action == "selection_prompt":
+            self._show_prompt(*payload)  # type: ignore[misc]
+        elif action == "mouse_down":
+            x, y = payload  # type: ignore[misc]
+            if not self.prompt.hit(x, y):
+                self.prompt.hide()
         elif action == "settings":
             self.settings.open()
         elif action == "set_engine":
@@ -150,6 +166,7 @@ class App:
     # ------------------------------------------------------------ 翻译流程
 
     def _start_translate(self) -> None:
+        self.prompt.hide()
         if self._busy:
             log.info("上一次翻译还没结束，忽略这次触发")
             return
@@ -214,6 +231,25 @@ class App:
     def _bubble(self, source: str, body: str, is_error: bool, auto_hide: bool = True) -> None:
         self.queue.put(("bubble", (source, body, is_error, auto_hide)))
 
+    def _show_prompt(self, x: int, y: int, press_hwnd: int) -> None:
+        """鼠标划选结束后，在松开的位置旁边放一个「翻译」按钮。"""
+        if not self.cfg.get("selection_button", True):
+            return
+        # 从我们自己的窗口上开始拖的（气泡、设置、按钮）不算划词。
+        # 用按下时的窗口句柄判断：气泡可能已经被拖到别处了，比坐标可靠。
+        if self._is_own_window(press_hwnd):
+            return
+        self.prompt.show(x, y)
+
+    def _is_own_window(self, hwnd: int) -> bool:
+        if not hwnd:
+            return False
+        return hwnd in (
+            self.bubble.hwnd(),
+            self.prompt.hwnd(),
+            self.settings.hwnd(),
+        )
+
     # ------------------------------------------------------------ 设置
 
     def apply_settings(self, new_cfg: dict) -> None:
@@ -233,6 +269,8 @@ class App:
         self.cfg = new_cfg
         self.bubble.cfg = new_cfg
         self.settings.cfg = new_cfg
+        if not new_cfg.get("selection_button", True):
+            self.prompt.hide()
         log.info("配置已更新：引擎=%s 热键=%s", new_cfg.get("engine"), new_cfg.get("hotkey"))
 
     def _set_engine(self, name: str) -> None:
@@ -271,6 +309,10 @@ class App:
 
     def quit(self) -> None:
         log.info("正在退出")
+        try:
+            self.mouse.stop()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.hotkeys.unregister()
         except Exception:  # noqa: BLE001

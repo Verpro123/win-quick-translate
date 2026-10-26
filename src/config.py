@@ -17,7 +17,7 @@ from typing import Any
 
 APP_NAME = "QuickTranslate"
 APP_TITLE = "划词翻译"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------- 默认配置
 
@@ -34,6 +34,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bubble_width": 520,
     # 气泡正文字号
     "font_size": 11,
+    # 选中文字后是否在鼠标旁弹出「翻译」小按钮
+    "selection_button": True,
     # 模拟复制后等待剪贴板更新的最长时间（秒）
     "capture_timeout": 0.6,
     # 允许翻译的最大字符数，超出则截断（防止一整篇文章糊满屏幕）

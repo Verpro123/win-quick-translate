@@ -38,7 +38,8 @@ def main() -> int:
     results.append(check("读取/写入配置", _config))
     results.append(check("剪贴板读写的往返", _clipboard))
     results.append(check("全局热键注册与注销", _hotkey))
-    results.append(check("创建气泡窗口", _bubble))
+    results.append(check("屏幕几何与多屏坐标", _desktop))
+    results.append(check("创建气泡与划词按钮", _bubble))
     results.append(check("绘制托盘图标", _icon))
     results.append(check("开机自启动读写权限", _autostart))
     results.append(check("单实例互斥锁", _mutex))
@@ -50,7 +51,7 @@ def main() -> int:
 
 
 def _imports():
-    import config, engines, capture, system, ui, tray  # noqa: F401
+    import config, engines, capture, system, ui, tray, desktop  # noqa: F401
     import tkinter
 
     return f"Python {sys.version.split()[0]} / Tk {tkinter.TkVersion}"
@@ -87,10 +88,25 @@ def _hotkey():
     return f"注册并注销 {combo}"
 
 
+def _desktop():
+    import desktop
+
+    x, y = desktop.cursor_pos()
+    left, top, right, bottom = desktop.monitor_work_area(x, y)
+    if right <= left or bottom <= top:
+        raise RuntimeError(f"工作区异常：{left},{top},{right},{bottom}")
+    vleft, vtop, vw, vh = desktop.virtual_screen()
+    return (
+        f"鼠标 ({x},{y}) 在当前屏 {right - left}×{bottom - top} 内；"
+        f"虚拟屏幕 {vw}×{vh} @ ({vleft},{vtop})"
+    )
+
+
 def _bubble():
     import tkinter as tk
 
     import config
+    import desktop
     import ui
 
     root = tk.Tk()
@@ -102,9 +118,19 @@ def _bubble():
         bubble.show("hello world", "翻译中…", auto_hide=False)
         root.update()
         bubble.hide()
+
+        prompt = ui.SelectionPrompt(root, lambda: None)
+        prompt.show(*desktop.cursor_pos())
+        root.update()
+        if prompt._rect is None or not prompt._win.winfo_viewable():
+            raise RuntimeError("划词按钮没有摆到鼠标旁边")
+        rx, ry, rw, rh = prompt._rect
+        if not prompt.hit(rx + rw // 2, ry + rh // 2):
+            raise RuntimeError("划词按钮点击区域异常")
+        prompt.hide()
     finally:
         root.destroy()
-    return "气泡显示与更新正常"
+    return "气泡与划词按钮显示正常"
 
 
 def _icon():
