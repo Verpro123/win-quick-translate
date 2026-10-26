@@ -96,9 +96,24 @@ def _desktop():
     if right <= left or bottom <= top:
         raise RuntimeError(f"工作区异常：{left},{top},{right},{bottom}")
     vleft, vtop, vw, vh = desktop.virtual_screen()
+
+    cases = [
+        # 资源管理器文件区（Win10 两种层级）、导航树、任务栏：不是选字
+        (["DirectUIHWND", "DUIViewWndClassName", "ShellTabWindowClass", "CabinetWClass"], False),
+        (["DirectUIHWND", "SHELLDLL_DefView", "CtrlNotifySink", "DirectUIHWND"], False),
+        (["SysTreeView32", "NamespaceTreeControl", "CtrlNotifySink", "#32770"], False),
+        (["MSTaskListWClass", "Shell_TrayWnd"], False),
+        # 浏览器 / 普通窗口的文本区：可以划词
+        (["Chrome_RenderWidgetHostHWND", "Chrome_WidgetWin_1"], True),
+        (["TkChild", "TkTopLevel"], True),
+    ]
+    for chain, expected in cases:
+        if desktop.chain_is_text_surface(chain) != expected:
+            raise RuntimeError(f"控件过滤判断错误：{chain} 应返回 {expected}")
+
     return (
         f"鼠标 ({x},{y}) 在当前屏 {right - left}×{bottom - top} 内；"
-        f"虚拟屏幕 {vw}×{vh} @ ({vleft},{vtop})"
+        f"虚拟屏幕 {vw}×{vh} @ ({vleft},{vtop})；外壳控件过滤正常"
     )
 
 

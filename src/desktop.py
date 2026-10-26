@@ -33,6 +33,7 @@ SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 
 MONITOR_DEFAULTTONEAREST = 2
+GA_PARENT = 1
 GA_ROOT = 2
 VK_LBUTTON = 0x01
 WM_NCHITTEST = 0x0084
@@ -48,6 +49,36 @@ _SKIP_CLASSES = {
     "TrayNotifyWnd",
     "DV2ControlHost",
     "SysListView32",
+}
+
+# 这些控件自己就是列表/图标/工具栏，拖动它们是框选或排序，不是选文字
+_NON_TEXT_LEAVES = {
+    "ListBox",
+    "Listbox",
+    "ComboBox",
+    "SysListView32",
+    "SysTreeView32",
+    "SysHeader32",
+    "SysTabControl32",
+    "SysMonthCal32",
+    "SysDateTimePick32",
+    "ToolbarWindow32",
+    "ReBarWindow32",
+    "MSTaskListWClass",
+    "DV2ControlHost",
+    "NetUIHWND",
+    "SHELLDLL_DefView",
+    "msctls_trackbar32",
+    "msctls_updown32",
+    "msctls_statusbar32",
+}
+
+# 资源管理器/桌面外壳的视图容器。最内层往往还是 DirectUIHWND，
+# 光看叶子类名分不出来，必须看这一层父控件。
+_SHELL_VIEW_CLASSES = {
+    "SHELLDLL_DefView",
+    "DUIViewWndClassName",
+    "NamespaceTreeControl",
 }
 
 
@@ -172,24 +203,52 @@ def window_at(x: int, y: int) -> int:
     return int(user32.GetAncestor(hwnd, GA_ROOT) or hwnd)
 
 
-def point_is_client(x: int, y: int) -> bool:
-    """判断该点落在普通客户区（而不是标题栏 / 边框 / 滚动条）里。
+def window_chain(x: int, y: int) -> list[str]:
+    """该点处从最内层控件到顶层窗口的类名列表。"""
+    chain: list[str] = []
+    current = user32.WindowFromPoint(POINT(x, y))
+    while current:
+        chain.append(_class_name(current))
+        parent = user32.GetAncestor(current, GA_PARENT)
+        if not parent or parent == current:
+            break
+        current = parent
+    return chain
 
-    用 WM_NCHITTEST 问目标窗口自己 —— 拖动标题栏、滚动条时返回的
-    是 HTCAPTION / HTVSCROLL，据此就能把"拖窗口"和"划选文字"分开。
+
+def chain_is_text_surface(chain: list[str]) -> bool:
+    """只看控件链，判断是不是"可以选文字"的地方（不碰系统 API，方便自检）。"""
+    if not chain:
+        return False
+    leaf, root = chain[0], chain[-1]
+    if leaf in _NON_TEXT_LEAVES or root in _SKIP_CLASSES:
+        return False
+    # 资源管理器的文件区/导航树、桌面外壳视图：最内层往往还是 DirectUIHWND，
+    # 只有看父控件这一层才能和真正的文本框区分开
+    return not any(name in _SHELL_VIEW_CLASSES for name in chain)
+
+
+def point_is_text_surface(x: int, y: int) -> bool:
+    """判断该点是否像"可以选文字"的地方。
+
+    先排除资源管理器的文件区（SHELLDLL_DefView）、导航树、任务栏、桌面等
+    拖框/拖图标的地方 —— 在这些地方按住左键划一下会选中多个文件/文件夹，
+    但不是选文字，不能弹翻译按钮。
+    再用 WM_NCHITTEST 区分客户区与标题栏 / 边框 / 滚动条。
     """
     try:
+        if not chain_is_text_surface(window_chain(x, y)):
+            return False
+
         hwnd = user32.WindowFromPoint(POINT(x, y))
         if not hwnd:
             return False
-        root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
-        if _class_name(root) in _SKIP_CLASSES:
-            return False
+        target = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
 
         packed = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
         result = ctypes.c_size_t(0)
         ok = user32.SendMessageTimeoutW(
-            root, WM_NCHITTEST, 0, packed,
+            target, WM_NCHITTEST, 0, packed,
             SMTO_ABORTIFHUNG, 60, ctypes.byref(result),
         )
         if not ok:
@@ -275,6 +334,9 @@ class SelectionWatcher:
                 dragged = _distance(release, press_pos) >= self.DRAG_MIN
                 if not (dragged or is_double):
                     continue
-                if not point_is_client(*release):
+                # 起点和终点都得像文字区：从资源管理器文件区拖到别处也不能弹
+                if not point_is_text_surface(*press_pos):
+                    continue
+                if not point_is_text_surface(*release):
                     continue
                 self._notify(self._on_select, release[0], release[1], press_hwnd)

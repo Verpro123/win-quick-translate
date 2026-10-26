@@ -17,7 +17,7 @@ from typing import Any
 
 APP_NAME = "QuickTranslate"
 APP_TITLE = "划词翻译"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # ---------------------------------------------------------------- 默认配置
 
