@@ -17,7 +17,7 @@ from typing import Any
 
 APP_NAME = "QuickTranslate"
 APP_TITLE = "划词翻译"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # ---------------------------------------------------------------- 默认配置
 
@@ -26,8 +26,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hotkey": "ctrl+alt+t",
     # 当前使用的引擎：baidu | ai
     "engine": "baidu",
-    # 气泡背景：blur = 抓屏做高斯模糊（毛玻璃），solid = 纯色卡片
+    # 气泡背景：blur = 抓屏做高斯模糊（毛玻璃）；gradient = 预置渐变玻璃；
+    # image = 自定义图片；solid = 纯色卡片
     "backdrop": "blur",
+    # 渐变配色，取值见 backgrounds.GRADIENT_PRESETS
+    "backdrop_gradient": "aurora",
+    # 自定义背景图片，相对路径按配置文件所在目录解析
+    "backdrop_image": "",
+    # 自定义图片的模糊半径（像素），0 表示不模糊
+    "backdrop_image_blur": 0,
+    # 渐变/图片上盖一层底色的浓度（0 全透 - 0.95 几乎不透明）
+    "backdrop_dim": 0.55,
+    # 缩放气泡时是否用快照实时刷新背景。关掉则缩放过程中只画纯色卡片
+    "backdrop_live_resize": True,
     # 气泡显示时长（秒），0 表示不自动关闭
     "bubble_timeout": 7.0,
     # 气泡宽度上限（像素）

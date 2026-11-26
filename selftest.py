@@ -39,6 +39,7 @@ def main() -> int:
     results.append(check("剪贴板读写的往返", _clipboard))
     results.append(check("全局热键注册与注销", _hotkey))
     results.append(check("屏幕几何与多屏坐标", _desktop))
+    results.append(check("生成渐变 / 图片背景", _backgrounds))
     results.append(check("创建气泡与划词按钮", _bubble))
     results.append(check("绘制托盘图标", _icon))
     results.append(check("开机自启动读写权限", _autostart))
@@ -135,7 +136,19 @@ def _desktop():
     )
 
 
+def _backgrounds():
+    import backgrounds
+
+    image = backgrounds.gradient((320, 480), "aurora")
+    if image.size != (320, 480) or image.mode != "RGB":
+        raise RuntimeError("渐变图尺寸或模式不对")
+    if backgrounds.load_image("", (16, 16)) is not None:
+        raise RuntimeError("空图片路径应该返回 None")
+    return f"{len(backgrounds.GRADIENT_PRESETS)} 套渐变，默认 {backgrounds.DEFAULT_GRADIENT}"
+
+
 def _bubble():
+    import types
     import tkinter as tk
 
     import config
@@ -145,11 +158,103 @@ def _bubble():
     root = tk.Tk()
     root.withdraw()
     try:
-        bubble = ui.BubbleWindow(root, config.load())
+        cfg = config.load()
+        bubble = ui.BubbleWindow(root, cfg)
         bubble.show("hello world", "你好，世界\n第二行译文", is_error=False)
         root.update()
         bubble.show("hello world", "翻译中…", auto_hide=False)
         root.update()
+        bubble.hide()
+
+        # 长内容：限高 + 滚轮翻页
+        long_text = "\n".join("第 %d 行 the quick brown fox" % i for i in range(150))
+        cfg["backdrop"] = "gradient"
+        bubble.show("hello world", long_text, auto_hide=False)
+        root.update()
+        if not bubble._scrollable:
+            raise RuntimeError("长内容没有进入滚动模式")
+        before = bubble._scroll
+        bubble._on_wheel(types.SimpleNamespace(delta=-120))
+        if bubble._scroll <= before:
+            raise RuntimeError("滚轮没有翻动长内容")
+
+        # 拖右下角：宽度 +60，内容重新换行
+        width, height = bubble._size
+        start = (bubble._pos[0] + width - 3, bubble._pos[1] + height - 3)
+        bubble._on_press(
+            types.SimpleNamespace(x=width - 3, y=height - 3, x_root=start[0], y_root=start[1])
+        )
+        bubble._on_motion(
+            types.SimpleNamespace(
+                x=width + 57, y=height - 3,
+                x_root=start[0] + 60, y_root=start[1],
+            )
+        )
+        bubble._apply_resize()
+        root.update()
+        if bubble._size[0] != width + 60:
+            raise RuntimeError(f"拖右下角没有改变宽度：{bubble._size}")
+        bubble._on_release(types.SimpleNamespace(x=0, y=0, x_root=start[0], y_root=start[1]))
+        root.update()
+
+        # 移动：拖动中背景保持不动（跟手重绘会卡），松手才重拍
+        cfg["backdrop"] = "blur"
+        cfg["backdrop_live_resize"] = True
+        bubble.show("hello world", "你好，世界\n第二行译文", auto_hide=False)
+        root.update()
+        width, height = bubble._size
+        origin = bubble._pos
+        center = (origin[0] + width // 2, origin[1] + height // 2)
+        before_photo = bubble._photo
+        bubble._on_press(
+            types.SimpleNamespace(x=width // 2, y=height // 2, x_root=center[0], y_root=center[1])
+        )
+        bubble._on_motion(
+            types.SimpleNamespace(
+                x=width // 2, y=height // 2,
+                x_root=center[0] - 80, y_root=center[1] - 40,
+            )
+        )
+        root.update()
+        if bubble._photo is not before_photo:
+            raise RuntimeError("移动过程中不该重绘背景")
+        if bubble._drag_snapshot is not None:
+            raise RuntimeError("移动过程中不该抓取背景快照")
+        bubble._on_release(
+            types.SimpleNamespace(x=0, y=0, x_root=center[0] - 80, y_root=center[1] - 40)
+        )
+        root.update()
+        if bubble._photo is before_photo:
+            raise RuntimeError("移动松手后没有重拍背景")
+
+        # 缩放：拖动中也要有背景预览（别退回纯色），松手后释放快照
+        width, height = bubble._size
+        sx, sy = bubble._pos
+        grip = (sx + width - 3, sy + height - 3)
+        preview_before = bubble._photo
+        bubble._on_press(
+            types.SimpleNamespace(x=width - 3, y=height - 3, x_root=grip[0], y_root=grip[1])
+        )
+        bubble._on_motion(
+            types.SimpleNamespace(
+                x=width + 57, y=height + 37,
+                x_root=grip[0] + 60, y_root=grip[1] + 40,
+            )
+        )
+        bubble._apply_resize()
+        root.update()
+        if bubble._drag_snapshot is None:
+            raise RuntimeError("缩放时没有抓到背景快照")
+        if bubble._photo is preview_before:
+            raise RuntimeError("缩放预览没有生成背景")
+        if not bubble._canvas.find_withtag("bg"):
+            raise RuntimeError("缩放中背景图元丢失")
+        bubble._on_release(
+            types.SimpleNamespace(x=0, y=0, x_root=grip[0] + 60, y_root=grip[1] + 40)
+        )
+        root.update()
+        if bubble._drag_snapshot is not None:
+            raise RuntimeError("缩放松手后快照没有释放")
         bubble.hide()
 
         prompt = ui.SelectionPrompt(root, lambda: None)
@@ -163,7 +268,7 @@ def _bubble():
         prompt.hide()
     finally:
         root.destroy()
-    return "气泡与划词按钮显示正常"
+    return "气泡与划词按钮显示正常，移动不重绘、缩放用快照预览"
 
 
 def _icon():

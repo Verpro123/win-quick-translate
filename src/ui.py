@@ -22,12 +22,15 @@ import logging
 import threading
 import tkinter as tk
 from ctypes import wintypes
+from pathlib import Path
+from tkinter import filedialog
 from tkinter import font as tkfont
 from tkinter import ttk
 
 import keyboard
 from PIL import Image, ImageDraw, ImageFilter, ImageGrab, ImageTk
 
+import backgrounds
 import config as config_mod
 import desktop
 import system
@@ -218,6 +221,16 @@ class BubbleWindow:
     GAP_LINE = 3
     QUOTE_INDENT = 16
 
+    # 长内容：超过屏幕就限高 + 滚轮翻页；右下角可以拖大小
+    MIN_CARD_W = 200
+    MIN_VIEW_H = 60
+    MAX_CARD_W = 1200
+    SCROLL_STEP = 64          # 滚轮一格滚动的像素
+    SCROLLBAR_W = 6
+    GRIP = 16                 # 右下角缩放手柄
+    EDGE = 5                  # 右边/下边拖拽缩放的命中宽度
+    LIVE_PREVIEW_DOWNSCALE = 2   # 缩放预览把底图先缩小这么多倍再模糊，省算力
+
     def __init__(self, root: tk.Tk, cfg: dict) -> None:
         self.root = root
         self.cfg = cfg
@@ -235,6 +248,30 @@ class BubbleWindow:
         # 自己记住窗口位置和尺寸：Win32 摆的窗口，tk 的 winfo 可能慢一拍
         self._pos: tuple[int, int] | None = None
         self._size: tuple[int, int] | None = None
+        # 最近一次的内容，尺寸变化时要用它重新排版
+        self._last: tuple[str, TranslationResult, bool] | None = None
+        self._colors: dict | None = None
+        self._painter = None
+        self._content_w = 0
+        self._full_h = 0        # 内容总高度
+        self._view_h = 0        # 当前可见高度
+        self._scroll = 0        # 已向上滚动的像素
+        self._scrollable = False
+        # 用户拖出来的尺寸，本次运行内一直沿用
+        self._width_override: int | None = None
+        self._height_override: int | None = None
+        # 滚轮条 / 缩放拖拽状态
+        self._scroll_drag = False
+        self._resizing = False
+        self._resize_origin: tuple[int, int, int, int, bool, bool] | None = None
+        self._resize_job: str | None = None
+        self._pending_size: tuple[int, int] | None = None
+        self._cursor = "fleur"
+        self._luminance_cache: dict[str, float] = {}
+        # 缩放时的背景预览：开局抓一张整屏快照，之后每帧只从里面裁
+        self._drag_snapshot: Image.Image | None = None
+        self._drag_meta: tuple | None = None
+        self._live_attempted = False
 
     # ---- 窗口生命周期 ----
 
@@ -262,6 +299,13 @@ class BubbleWindow:
         win.bind("<ButtonRelease-1>", self._on_release)
         win.bind("<Enter>", lambda _e: self._cancel_timer())
         win.bind("<Leave>", lambda _e: self._arm_timer())
+        win.bind("<Motion>", self._on_hover)
+        # 窗口是 WS_EX_NOACTIVATE，但 Win10 1703 起滚轮按"指针下的窗口"投递，
+        # 悬停即可滚动；X11 的 Button-4/5 一并兼容。
+        win.bind("<MouseWheel>", self._on_wheel)
+        canvas.bind("<MouseWheel>", self._on_wheel)
+        win.bind("<Button-4>", lambda event: self._on_wheel(event, 1))
+        win.bind("<Button-5>", lambda event: self._on_wheel(event, -1))
 
         self._win = win
         self._canvas = canvas
@@ -269,6 +313,19 @@ class BubbleWindow:
 
     def hide(self) -> None:
         self._cancel_timer()
+        if self._resize_job is not None:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except (ValueError, tk.TclError):
+                pass
+            self._resize_job = None
+        self._dragging = False
+        self._resizing = False
+        self._scroll_drag = False
+        self._resize_origin = None
+        self._drag_start = None
+        self._drag_offset = None
+        self._clear_drag_snapshot()
         if self._win is not None and self._win.winfo_exists():
             self._win.withdraw()
 
@@ -284,67 +341,349 @@ class BubbleWindow:
         if isinstance(result, str):
             result = TranslationResult(raw=result)
 
-        win = self._ensure_window()
-        canvas = self._canvas
-        assert canvas is not None
-        canvas.delete("all")
-
-        colors = GLASS_DARK if system_is_dark() else GLASS_LIGHT
-        font_size = int(self.cfg.get("font_size", 11))
-
-        # 1) 先把内容排好：量出卡片尺寸，同时拿到"真正绘制"的闭包
-        #    此时窗口还藏着，抓屏不会拍到上一次的气泡
-        content_w, card_h, painter = self._layout(source, result, is_error, colors, font_size)
-        card_w = content_w + self.PAD_X * 2
-
-        # 2) 定位：每次都贴着鼠标弹，鼠标在哪块屏就出现在哪块屏。
-        #    正拖着的时候结果恰好回来，就留在手底下，别把窗口抢回去。
-        if self._dragging and self._pos is not None:
-            x, y = desktop.clamp_to_work_area(self._pos[0], self._pos[1], card_w, card_h)
-        else:
-            self._dragging = False
-            self._dragged = False
-            self._drag_start = None
-            self._drag_offset = None
-            x, y = self._place(card_w, card_h)
-
-        # 3) 背景：先拍好新底图，再一次性清空重画。
-        #    中间不 update，屏幕上只会看到旧画面直接跳成新画面，没有闪烁。
-        canvas.configure(width=card_w, height=card_h)
-        image = self._backdrop_image(x, y, card_w, card_h, colors, win)
-        canvas.delete("all")
-        self._draw_backdrop(canvas, card_w, card_h, colors, image)
-
-        # 4) 铺内容
-        painter()
-
-        self._pos = (x, y)
-        self._size = (card_w, card_h)
-        place_window(win, x, y, card_w, card_h)
-        win.deiconify()
-        win.lift()
+        self._last = (source, result, is_error)
+        colors = self._pick_palette()
+        self._colors = colors
+        self._render(colors, reposition=not self._dragging, reset_scroll=True)
 
         if auto_hide:
             self._arm_timer()
         else:
             self._cancel_timer()
 
+    def _pick_palette(self) -> dict:
+        """渐变/图片是花哨底图，按底图亮度挑字色；其余跟随系统深浅色。"""
+        mode = self._backdrop_mode()
+        if mode in {"gradient", "image"}:
+            luminance = self._base_luminance(mode)
+            if luminance is not None:
+                return GLASS_DARK if luminance < 155 else GLASS_LIGHT
+        return GLASS_DARK if system_is_dark() else GLASS_LIGHT
+
+    def _base_luminance(self, mode: str) -> float | None:
+        if mode == "gradient":
+            return backgrounds.preset_luminance(
+                str(self.cfg.get("backdrop_gradient", ""))
+            )
+        path = self._image_path()
+        if not path:
+            return None
+        cached = self._luminance_cache.get(path)
+        if cached is not None:
+            return cached
+        value = backgrounds.image_luminance(path)
+        if value is not None:
+            self._luminance_cache[path] = value
+        return value
+
+    def _render(
+        self,
+        colors: dict,
+        reposition: bool = True,
+        reset_scroll: bool = False,
+        preview: bool = False,
+    ) -> None:
+        """排版 → 定位 → 铺背景 → 铺内容。新译文、拖动结束、缩放都走这里。"""
+        win = self._ensure_window()
+        canvas = self._canvas
+        assert canvas is not None
+        if self._last is None:
+            return
+
+        source, result, is_error = self._last
+        font_size = int(self.cfg.get("font_size", 11))
+
+        max_width = self._width_override or int(self.cfg.get("bubble_width", 520))
+        content_w, full_h, painter = self._layout(
+            source, result, is_error, colors, font_size,
+            max_width=max_width, force_width=self._width_override,
+        )
+        card_w = max(self.MIN_CARD_W, content_w + self.PAD_X * 2)
+
+        # 高度封顶：内容再长也不越过当前屏幕的工作区，剩下的交给滚轮
+        max_h = self._max_view_height()
+        if self._height_override is not None:
+            view_h = min(full_h, max(self.MIN_VIEW_H, min(self._height_override, max_h)))
+        else:
+            view_h = min(full_h, max_h)
+        view_h = max(1, int(view_h))
+
+        if reset_scroll:
+            self._scroll = 0
+        max_scroll = max(0, full_h - view_h)
+        self._scroll = max(0, min(self._scroll, max_scroll))
+        self._scrollable = max_scroll > 0
+
+        self._content_w = content_w
+        self._full_h = full_h
+        self._view_h = view_h
+        self._painter = painter
+
+        # 定位：新译文贴着鼠标弹；拖动/缩放中则留在原地。
+        if reposition and not self._dragging:
+            self._dragging = False
+            self._dragged = False
+            self._drag_start = None
+            self._drag_offset = None
+            x, y = self._place(card_w, view_h)
+        elif self._pos is None:
+            x, y = self._place(card_w, view_h)
+        else:
+            x, y = desktop.clamp_to_work_area(self._pos[0], self._pos[1], card_w, view_h)
+
+        canvas.configure(width=card_w, height=view_h)
+        image = self._backdrop_image(
+            x, y, card_w, view_h, colors, win, live=preview
+        )
+        canvas.delete("all")
+        self._draw_backdrop(canvas, card_w, view_h, colors, image)
+        painter()
+        if self._scroll:
+            canvas.move("content", 0, -self._scroll)
+        self._draw_scrollbar(card_w, view_h, colors)
+
+        self._pos = (x, y)
+        self._size = (card_w, view_h)
+        place_window(win, x, y, card_w, view_h)
+        win.deiconify()
+        win.lift()
+
+    def _max_view_height(self) -> int:
+        """当前屏幕工作区能容纳的气泡最大高度，留一点上下呼吸空间。"""
+        _left, top, _right, bottom = desktop.monitor_work_area(*desktop.cursor_pos())
+        return max(self.MIN_VIEW_H, bottom - top - 28)
+
     # ---- 背景：自绘毛玻璃 ----
 
     def _backdrop_image(
-        self, x: int, y: int, width: int, height: int, colors: dict, win: tk.Toplevel
+        self, x: int, y: int, width: int, height: int, colors: dict,
+        win: tk.Toplevel, live: bool = False,
     ) -> ImageTk.PhotoImage | None:
-        """取（或复用）毛玻璃底图；纯色模式或抓屏失败时返回 None。"""
-        if str(self.cfg.get("backdrop", "blur")).lower() != "blur":
+        """取（或复用）背景底图；纯色模式或生成失败时返回 None。
+
+        live=True 是拖动 / 缩放中的预览帧：不抓屏，从快照里裁，也不进缓存 ——
+        预览帧的尺寸或位置每帧都在变，缓存没有意义。
+        """
+        mode = self._backdrop_mode()
+        if mode == "solid":
             return None
-        key = (x, y, width, height)
+        if live:
+            card = self._compose_backdrop(
+                mode, x, y, width, height, colors, win, live=True
+            )
+            if card is None:
+                return None
+            photo = ImageTk.PhotoImage(card)
+            self._photo = photo
+            self._photo_key = None      # 标记成预览图：之后必须全量重算
+            return photo
+        key = self._backdrop_key(mode, x, y, width, height, colors)
         if self._photo is not None and self._photo_key == key:
             return self._photo
-        image = self._capture_backdrop(x, y, width, height, colors, win)
-        if image is not None:
-            self._photo = image
-            self._photo_key = key
-        return image
+        card = self._compose_backdrop(mode, x, y, width, height, colors, win)
+        if card is None:
+            return None
+        photo = ImageTk.PhotoImage(card)
+        self._photo = photo
+        self._photo_key = key
+        return photo
+
+    def _backdrop_mode(self) -> str:
+        mode = str(self.cfg.get("backdrop", "blur")).lower()
+        return mode if mode in {"blur", "gradient", "image", "solid"} else "blur"
+
+    def _backdrop_key(
+        self, mode: str, x: int, y: int, width: int, height: int, colors: dict
+    ) -> tuple:
+        key: tuple = (mode, width, height, colors.get("tint"))
+        if mode == "blur":
+            key += (x, y)                 # 毛玻璃取样位置一变就得重拍
+        elif mode == "gradient":
+            key += (str(self.cfg.get("backdrop_gradient", "")),)
+        elif mode == "image":
+            key += (
+                self._image_path(),
+                round(self._image_blur(), 2),
+                round(self._dim_opacity(colors), 3),
+            )
+        return key
+
+    def _image_blur(self) -> float:
+        try:
+            value = float(self.cfg.get("backdrop_image_blur", 0) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        return max(0.0, min(60.0, value))
+
+    def _image_path(self) -> str:
+        """自定义图片路径；相对路径按配置文件所在目录解析。"""
+        raw = str(self.cfg.get("backdrop_image", "") or "").strip()
+        if not raw:
+            return ""
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = config_mod.config_path().parent / path
+        return str(path)
+
+    def _compose_backdrop(
+        self, mode: str, x: int, y: int, width: int, height: int,
+        colors: dict, win: tk.Toplevel, live: bool = False,
+    ) -> Image.Image | None:
+        """按模式生成卡片底图（含圆角与描边）。失败返回 None，调用方退回纯色。
+
+        live=True 是拖动中的预览帧：底图从拖动开局那张快照里裁，不再抓屏。
+        """
+        try:
+            if live:
+                base = self._base_from_snapshot(mode, x, y, width, height)
+                if base is None and mode == "gradient":
+                    # 快照都拿不到时至少给渐变色，别让渐变主题掉成纯色
+                    base = backgrounds.gradient(
+                        (width, height), str(self.cfg.get("backdrop_gradient", ""))
+                    )
+            elif mode == "blur":
+                snapshot = self._grab_behind(x, y, width, height, win)
+                base = (
+                    None if snapshot is None
+                    else snapshot.filter(ImageFilter.GaussianBlur(11))
+                )
+            elif mode == "gradient":
+                base = backgrounds.gradient(
+                    (width, height), str(self.cfg.get("backdrop_gradient", ""))
+                )
+                # 渐变底下再掺一点真实画面，才像"毛玻璃渐变"而不是一张色纸
+                snapshot = self._grab_behind(x, y, width, height, win)
+                if snapshot is not None:
+                    frosted = snapshot.filter(ImageFilter.GaussianBlur(18))
+                    base = Image.blend(base, frosted, 0.3)
+            elif mode == "image":
+                base = backgrounds.load_image(
+                    self._image_path(), (width, height), self._image_blur()
+                )
+                if base is None:
+                    # 图片没配或读不出来时退回渐变，别让气泡变成纯黑
+                    base = backgrounds.gradient(
+                        (width, height), str(self.cfg.get("backdrop_gradient", ""))
+                    )
+            else:
+                return None
+
+            if base is None:
+                return None
+            return self._finish_card(base, mode, width, height, colors)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("背景生成失败，退回纯色：%s", exc)
+            return None
+
+    def _finish_card(
+        self, base: Image.Image, mode: str, width: int, height: int, colors: dict
+    ) -> Image.Image:
+        """底图 → 盖底色 → 切圆角 → 描边，得到最终卡片底图。"""
+        opacity = self._scrim_opacity(mode, colors)
+        tint = Image.new("RGB", (width, height), colors["tint"])
+        blended = Image.blend(base.convert("RGB"), tint, opacity)
+
+        # 切圆角
+        mask = Image.new("L", (width, height), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, width - 1, height - 1], radius=self.RADIUS, fill=255
+        )
+        card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        card.paste(blended, (0, 0), mask)
+
+        # 描一圈边，让卡片轮廓立住。
+        # 这里不能用半透明色：layered window 不做 alpha 合成，半透明像素会和
+        # 键控透明色混成一圈粉边。
+        ImageDraw.Draw(card).rounded_rectangle(
+            [0, 0, width - 1, height - 1],
+            radius=self.RADIUS,
+            outline=self._rgba(colors["border"], 255),
+            width=1,
+        )
+        return card
+
+    def _base_from_snapshot(
+        self, mode: str, x: int, y: int, width: int, height: int
+    ) -> Image.Image | None:
+        """拖动预览用：从开局那张整屏快照里裁出窗口背后那块。
+
+        先降采样再模糊，模糊半径跟着按比例缩小，视觉上和全分辨率差不多，
+        但每帧开销只剩几分之一 —— 最贵的抓屏那一步已经被省掉了。
+        """
+        snapshot, meta = self._drag_snapshot, self._drag_meta
+        if snapshot is None or meta is None:
+            return None
+
+        left, top, scale_x, scale_y = meta
+        shot_w, shot_h = snapshot.size
+        box = (
+            min(shot_w, max(0, round((x - left) * scale_x))),
+            min(shot_h, max(0, round((y - top) * scale_y))),
+            min(shot_w, max(0, round((x - left + width) * scale_x))),
+            min(shot_h, max(0, round((y - top + height) * scale_y))),
+        )
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        region = snapshot.crop(box)
+
+        step = max(1, self.LIVE_PREVIEW_DOWNSCALE)
+        small = (max(1, width // step), max(1, height // step))
+        if region.size != small:
+            region = region.resize(small, Image.BILINEAR)
+
+        if mode == "blur":
+            base = region.filter(ImageFilter.GaussianBlur(11 / step))
+        elif mode == "gradient":
+            base = backgrounds.gradient(
+                small, str(self.cfg.get("backdrop_gradient", ""))
+            )
+            base = Image.blend(
+                base, region.filter(ImageFilter.GaussianBlur(18 / step)), 0.3
+            )
+        else:
+            # image 模式预览：先用背后画面顶着，松手后再换回真正的图片
+            base = region.filter(ImageFilter.GaussianBlur(18 / step))
+
+        if base.size != (width, height):
+            base = base.resize((width, height), Image.BILINEAR)
+        return base
+
+    def _scrim_opacity(self, mode: str, colors: dict) -> float:
+        """底图上盖的底色浓度：保证文字在花哨背景上也能看清。"""
+        if mode == "blur":
+            return float(colors.get("tint_opacity", 0.84))
+        return self._dim_opacity(colors)
+
+    def _dim_opacity(self, colors: dict) -> float:
+        try:
+            value = float(self.cfg.get("backdrop_dim", 0.55))
+        except (TypeError, ValueError):
+            value = 0.55
+        value = max(0.0, min(0.95, value))
+        if colors is GLASS_LIGHT:
+            # 浅色主题是深色字，底色得更实一点才压得住图片
+            value = max(value, 0.66)
+        return value
+
+    def _grab_behind(
+        self, x: int, y: int, width: int, height: int, win: tk.Toplevel
+    ) -> Image.Image | None:
+        """抓窗口背后那块屏幕。优先「截屏排除」，不支持的旧系统才隐藏窗口。"""
+        excluded = False
+        withdrawn = False
+        try:
+            if win.winfo_viewable():
+                excluded = _hide_from_capture(win)
+                if not excluded:
+                    win.withdraw()
+                    win.update()
+                    withdrawn = True
+            return self._grab_region(x, y, width, height)
+        finally:
+            if excluded:
+                _show_in_capture(win)
+            elif withdrawn:
+                win.deiconify()
 
     def _draw_backdrop(
         self, canvas: tk.Canvas, width: int, height: int,
@@ -358,58 +697,6 @@ class BubbleWindow:
                 fill=colors["tint"], outline=colors["border"], width=1, tags="bg",
             )
         canvas.tag_lower("bg")
-
-    def _capture_backdrop(
-        self, x: int, y: int, width: int, height: int, colors: dict, win: tk.Toplevel
-    ) -> ImageTk.PhotoImage | None:
-        """拍下 (x, y) 处 width×height 的屏幕，模糊后切圆角。"""
-        excluded = False
-        withdrawn = False
-        try:
-            # 别把气泡自己拍进去。优先"截屏时排除该窗口"，屏幕上不隐藏；
-            # 系统太老不支持时才退回先隐藏、拍完再显示。
-            if win.winfo_viewable():
-                excluded = _hide_from_capture(win)
-                if not excluded:
-                    win.withdraw()
-                    win.update()
-                    withdrawn = True
-
-            snapshot = self._grab_region(x, y, width, height)
-            if snapshot is None:
-                return None
-
-            blurred = snapshot.convert("RGB").filter(ImageFilter.GaussianBlur(11))
-
-            tint = Image.new("RGB", (width, height), colors["tint"])
-            blended = Image.blend(blurred, tint, float(colors["tint_opacity"]))
-
-            # 切圆角
-            mask = Image.new("L", (width, height), 0)
-            ImageDraw.Draw(mask).rounded_rectangle(
-                [0, 0, width - 1, height - 1], radius=self.RADIUS, fill=255
-            )
-            card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            card.paste(blended, (0, 0), mask)
-
-            # 描一圈边，让卡片轮廓立住。
-            # 这里不能用半透明色：layered window 不做 alpha 合成，半透明像素会和
-            # 键控透明色混成一圈粉边。
-            ImageDraw.Draw(card).rounded_rectangle(
-                [0, 0, width - 1, height - 1],
-                radius=self.RADIUS,
-                outline=self._rgba(colors["border"], 255),
-                width=1,
-            )
-            return ImageTk.PhotoImage(card)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("背景模糊失败，退回纯色：%s", exc)
-            return None
-        finally:
-            if excluded:
-                _show_in_capture(win)
-            elif withdrawn:
-                win.deiconify()
 
     @staticmethod
     def _grab_region(x: int, y: int, width: int, height: int) -> Image.Image | None:
@@ -454,12 +741,18 @@ class BubbleWindow:
             )
         return self._font_cache[key]
 
-    def _layout(self, source, result, is_error, colors, font_size):
+    def _layout(
+        self, source, result, is_error, colors, font_size,
+        max_width=None, force_width=None,
+    ):
         """算出卡片内容宽度与整体高度，并返回「真正往画布上画」的闭包。
 
         分两步是因为：宽度决定卡片尺寸，尺寸决定卡片位置，位置决定该抓哪块屏。
+        force_width 用于用户手动拖过宽度之后：这时宽度要严格跟着拖，
+        不能再被「内容本来就这么宽」压回去。
         """
-        max_width = int(self.cfg.get("bubble_width", 520))
+        max_width = int(max_width or self.cfg.get("bubble_width", 520))
+        max_width = max(180, max_width)
         f_source = self._font(max(8, font_size - 2))
         f_phonetic = self._font(max(9, font_size - 1))
         f_body = self._font(font_size)
@@ -509,7 +802,11 @@ class BubbleWindow:
                 for line in block[1]:
                     natural = max(natural, self._measure(block[2], line) + self.QUOTE_INDENT)
 
-        content_w = max(180, min(max_width, natural))
+        if force_width is not None:
+            limit = self.MAX_CARD_W - self.PAD_X * 2
+            content_w = max(180, min(limit, int(force_width)))
+        else:
+            content_w = max(180, min(max_width, natural))
 
         def painter() -> int:
             canvas = self._canvas
@@ -526,13 +823,13 @@ class BubbleWindow:
                     canvas.create_line(
                         self.PAD_X, y, self.PAD_X + content_w, y,
                         fill=colors["divider"] if dash is None else colors["dashed"],
-                        dash=dash,
+                        dash=dash, tags="content",
                     )
                 elif kind == "text":
                     _, text, font, fill = block
                     item = canvas.create_text(
                         self.PAD_X, y, text=text, width=content_w,
-                        anchor="nw", font=font, fill=fill,
+                        anchor="nw", font=font, fill=fill, tags="content",
                     )
                     y = canvas.bbox(item)[3]
                 elif kind == "quote":
@@ -543,13 +840,13 @@ class BubbleWindow:
                         item = canvas.create_text(
                             self.PAD_X + self.QUOTE_INDENT, y, text=line,
                             width=content_w - self.QUOTE_INDENT,
-                            anchor="nw", font=font, fill=fill,
+                            anchor="nw", font=font, fill=fill, tags="content",
                         )
                         y = canvas.bbox(item)[3] + self.GAP_LINE
                     # 例句左侧的引用竖线
                     canvas.create_line(
                         self.PAD_X + 3, quote_top, self.PAD_X + 3, y - self.GAP_LINE,
-                        fill=colors["quote"], width=2,
+                        fill=colors["quote"], width=2, tags="content",
                     )
 
             return y
@@ -590,10 +887,151 @@ class BubbleWindow:
         y = max(top + 8, min(y, bottom - height - 8))
         return x, y
 
-    # ---- 拖动 ----
+    # ---- 滚动 ----
+
+    def _thumb_geometry(
+        self, width: int, height: int
+    ) -> tuple[int, int, int, int] | None:
+        """返回 (轨道顶, 轨道高, 滑块顶, 滑块高)；不需要滚动条时为 None。"""
+        if not self._scrollable or self._full_h <= self._view_h:
+            return None
+        track_top = self.PAD_Y
+        track_h = max(24, height - self.PAD_Y * 2 - 6)
+        thumb_h = min(
+            track_h, max(30, round(track_h * self._view_h / max(1, self._full_h)))
+        )
+        span = max(1, track_h - thumb_h)
+        ratio = self._scroll / max(1, self._full_h - self._view_h)
+        return track_top, track_h, track_top + round(span * ratio), thumb_h
+
+    def _draw_scrollbar(self, width: int, height: int, colors: dict) -> None:
+        """画右侧滚动条和右下角缩放手柄。返回轨道顶部，方便命中测试复用。"""
+        canvas = self._canvas
+        if canvas is None:
+            return
+        canvas.delete("scroll")
+
+        geo = self._thumb_geometry(width, height)
+        if geo is not None:
+            track_top, track_h, thumb_top, thumb_h = geo
+            x1 = width - self.SCROLLBAR_W - 8
+            x2 = x1 + self.SCROLLBAR_W
+            canvas.create_line(
+                (x1 + x2) / 2, track_top, (x1 + x2) / 2, track_top + track_h,
+                fill=colors["dashed"], width=self.SCROLLBAR_W,
+                capstyle="round", tags="scroll",
+            )
+            _rounded_rect(
+                canvas, x1, thumb_top, x2, thumb_top + thumb_h, 3,
+                fill=colors["label"], outline="", tags="scroll",
+            )
+            canvas.tag_raise("scroll")
+
+        # 右下角三道斜线：提示这里可以拖大小
+        gx, gy = width - 5, height - 5
+        for offset in (0, 5, 10):
+            canvas.create_line(
+                gx - offset, gy, gx, gy - offset,
+                fill=colors["label"], width=2, tags="scroll",
+            )
+        canvas.tag_raise("scroll")
+
+    def _scroll_to(self, value: float) -> None:
+        if not self._scrollable or self._canvas is None or self._size is None:
+            return
+        max_scroll = max(0, self._full_h - self._view_h)
+        target = max(0, min(int(round(value)), max_scroll))
+        if target == self._scroll:
+            return
+        delta = self._scroll - target
+        self._scroll = target
+        self._canvas.move("content", 0, delta)
+        self._draw_scrollbar(self._size[0], self._size[1], self._colors or GLASS_DARK)
+
+    def _scroll_from_track(self, y: int) -> int:
+        if self._size is None:
+            return self._scroll
+        geo = self._thumb_geometry(*self._size)
+        if geo is None:
+            return self._scroll
+        track_top, track_h, _thumb_top, thumb_h = geo
+        span = max(1, track_h - thumb_h)
+        ratio = (y - track_top - thumb_h / 2) / span
+        ratio = max(0.0, min(1.0, ratio))
+        return round(ratio * max(0, self._full_h - self._view_h))
+
+    def _hit_scrollbar(self, x: int, y: int) -> bool:
+        if self._size is None:
+            return False
+        width, height = self._size
+        geo = self._thumb_geometry(width, height)
+        if geo is None:
+            return False
+        track_top, track_h, _thumb_top, _thumb_h = geo
+        return (
+            width - self.SCROLLBAR_W - 12 <= x <= width - 6
+            and track_top <= y <= track_top + track_h
+        )
+
+    def _hit_grip(self, x: int, y: int) -> bool:
+        if self._size is None:
+            return False
+        width, height = self._size
+        return x >= width - self.GRIP and y >= height - self.GRIP
+
+    def _on_wheel(self, event, direction: int = 0) -> str:
+        if not self._scrollable:
+            return ""
+        self._cancel_timer()
+        if direction:
+            notches = float(direction)
+        else:
+            delta = getattr(event, "delta", 0) or 0
+            notches = delta / 120.0 if delta else 0.0
+        if notches:
+            self._scroll_to(self._scroll - notches * self.SCROLL_STEP)
+        return "break"
+
+    def _on_hover(self, event) -> None:
+        win, size = self._win, self._size
+        if win is None or size is None or not win.winfo_exists():
+            return
+        if self._dragging or self._resizing or self._scroll_drag:
+            return
+        width, height = size
+        if self._hit_grip(event.x, event.y):
+            cursor = "size_nw_se"
+        elif event.x >= width - self.EDGE:
+            cursor = "sb_h_double_arrow"
+        elif event.y >= height - self.EDGE:
+            cursor = "sb_v_double_arrow"
+        elif self._hit_scrollbar(event.x, event.y):
+            cursor = "hand2"
+        else:
+            cursor = "fleur"
+        if cursor != self._cursor:
+            self._cursor = cursor
+            win.configure(cursor=cursor)
+
+    # ---- 拖动 / 缩放 ----
 
     def _on_press(self, event) -> None:
         self._cancel_timer()
+        if self._size is not None:
+            width, height = self._size
+            if self._hit_grip(event.x, event.y):
+                self._begin_resize(event, True, True)
+                return
+            if self._hit_scrollbar(event.x, event.y):
+                self._scroll_drag = True
+                self._scroll_to(self._scroll_from_track(event.y))
+                return
+            resize_w = event.x >= width - self.EDGE
+            resize_h = event.y >= height - self.EDGE
+            if resize_w or resize_h:
+                self._begin_resize(event, resize_w, resize_h)
+                return
+
         self._dragging = True
         self._dragged = False
         self._drag_start = (event.x_root, event.y_root)
@@ -604,9 +1042,59 @@ class BubbleWindow:
             event.y_root - self._pos[1],
         )
 
+    def _begin_resize(self, event, resize_w: bool, resize_h: bool) -> None:
+        if self._size is None:
+            return
+        self._resizing = True
+        width, height = self._size
+        self._resize_origin = (
+            event.x_root, event.y_root, width, height, resize_w, resize_h,
+        )
+
+    def _resize_motion(self, event) -> None:
+        if self._resize_origin is None:
+            return
+        start_x, start_y, width0, height0, resize_w, resize_h = self._resize_origin
+        new_w = width0 + (event.x_root - start_x) if resize_w else width0
+        new_h = height0 + (event.y_root - start_y) if resize_h else height0
+        new_w = max(self.MIN_CARD_W, min(self.MAX_CARD_W, new_w))
+        new_h = max(self.MIN_VIEW_H, min(self._max_view_height(), new_h))
+        self._pending_size = (int(new_w), int(new_h))
+        if self._resize_job is None:
+            # 拖动期间 30ms 合并一次重排，别每个像素都排版一遍
+            self._resize_job = self.root.after(30, self._apply_resize)
+
+    def _apply_resize(self, final: bool = False) -> None:
+        self._resize_job = None
+        if self._colors is None:
+            return
+        changed = False
+        if self._pending_size is not None:
+            width, height = self._pending_size
+            self._pending_size = None
+            self._width_override = max(180, width - self.PAD_X * 2)
+            self._height_override = height
+            changed = True
+        if self._width_override is None:
+            return
+        if final:
+            # 松手后重拍全质量背景，把预览帧换掉
+            self._render(self._colors, reposition=False)
+        elif changed:
+            # 拖动过程中不抓屏：用开局那张快照裁出预览背景（不再是纯色卡片）
+            self._ensure_drag_snapshot()
+            self._render(self._colors, reposition=False, preview=True)
+
     def _on_motion(self, event) -> None:
         win = self._win
         if win is None or not win.winfo_exists():
+            return
+        if self._scroll_drag:
+            offset = self._pos[1] if self._pos is not None else 0
+            self._scroll_to(self._scroll_from_track(event.y_root - offset))
+            return
+        if self._resizing:
+            self._resize_motion(event)
             return
         if self._drag_start is None or self._drag_offset is None:
             return
@@ -627,9 +1115,31 @@ class BubbleWindow:
         place_window(win, x, y, width, height)
 
     def _on_release(self, _event) -> None:
+        if self._scroll_drag:
+            self._scroll_drag = False
+            if not self._cursor_inside():
+                self._arm_timer()
+            return
+
+        if self._resizing:
+            self._resizing = False
+            self._resize_origin = None
+            if self._resize_job is not None:
+                try:
+                    self.root.after_cancel(self._resize_job)
+                except (ValueError, tk.TclError):
+                    pass
+                self._resize_job = None
+            self._apply_resize(final=True)
+            self._clear_drag_snapshot()
+            if not self._cursor_inside():
+                self._arm_timer()
+            return
+
         self._dragging = False
         self._drag_start = None
         self._drag_offset = None
+        self._clear_drag_snapshot()
 
         if not self._dragged:
             self.hide()  # 没挪动就是点击，沿用「点一下关掉」
@@ -660,7 +1170,8 @@ class BubbleWindow:
             return
 
         x, y = self._pos
-        colors = GLASS_DARK if system_is_dark() else GLASS_LIGHT
+        colors = self._pick_palette()
+        self._colors = colors
         self._photo = None
         self._photo_key = None
         # 先拍新图（旧背景还在屏幕上，抓屏时窗口会被排除），
@@ -668,6 +1179,62 @@ class BubbleWindow:
         image = self._backdrop_image(x, y, width, height, colors, win)
         canvas.delete("bg")
         self._draw_backdrop(canvas, width, height, colors, image)
+
+    # ---- 缩放时的背景预览 ----
+
+    def _live_preview_enabled(self) -> bool:
+        if not bool(self.cfg.get("backdrop_live_resize", True)):
+            return False
+        # 纯色模式本来就没什么可重画的
+        return self._backdrop_mode() != "solid"
+
+    def _ensure_drag_snapshot(self) -> bool:
+        """确保本次缩放有一张可以反复裁剪的整屏快照。
+
+        一次缩放只尝试拍一次：拿不到就安静退化，预览退回纯色卡片。
+        """
+        if self._drag_snapshot is not None:
+            return True
+        if not self._live_preview_enabled() or self._live_attempted:
+            return False
+        self._live_attempted = True
+        self._capture_drag_snapshot()
+        return self._drag_snapshot is not None
+
+    def _capture_drag_snapshot(self) -> None:
+        """抓一张整屏快照，缩放预览时每帧只从里面裁。
+
+        窗口先被排除出截屏再拍，否则拍到的就是气泡自己。抓屏是整个流程里
+        最贵的一步（十几到几十毫秒），一次缩放只付一次。
+        """
+        win = self._win
+        if win is None or not win.winfo_exists() or not win.winfo_viewable():
+            return
+        if not _hide_from_capture(win):
+            log.debug("拖动快照不可用（截屏排除失败），退回松手后重拍")
+            return
+        try:
+            snapshot = ImageGrab.grab(all_screens=True).convert("RGB")
+            left, top, virtual_w, virtual_h = desktop.virtual_screen()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("拖动快照失败：%s", exc)
+            return
+        finally:
+            _show_in_capture(win)
+        if virtual_w <= 0 or virtual_h <= 0:
+            return
+        self._drag_snapshot = snapshot
+        self._drag_meta = (
+            left,
+            top,
+            snapshot.width / virtual_w,
+            snapshot.height / virtual_h,
+        )
+
+    def _clear_drag_snapshot(self) -> None:
+        self._drag_snapshot = None
+        self._drag_meta = None
+        self._live_attempted = False
 
     def hwnd(self) -> int:
         """窗口句柄；没创建或已销毁时返回 0。"""
@@ -682,8 +1249,8 @@ class BubbleWindow:
     # ---- 自动收起 ----
 
     def _arm_timer(self) -> None:
-        if self._dragging:
-            return  # 拖动过程中别被自动收起
+        if self._dragging or self._resizing or self._scroll_drag:
+            return  # 拖动 / 缩放 / 拖滚动条的过程中别被自动收起
         self._cancel_timer()
         timeout = float(self.cfg.get("bubble_timeout", 7.0))
         if timeout <= 0:
@@ -858,7 +1425,12 @@ class SelectionPrompt:
 
 
 ENGINE_LABELS = [("baidu", "百度翻译"), ("ai", "AI 大模型")]
-BACKDROP_LABELS = [("blur", "毛玻璃（模糊背后画面）"), ("solid", "纯色卡片")]
+BACKDROP_LABELS = [
+    ("blur", "毛玻璃"),
+    ("gradient", "渐变玻璃"),
+    ("image", "自定义图片"),
+    ("solid", "纯色卡片"),
+]
 
 
 class SettingsWindow:
@@ -880,7 +1452,8 @@ class SettingsWindow:
         win = tk.Toplevel(self.root)
         self.win = win
         win.title(f"{config_mod.APP_TITLE} · 设置")
-        win.resizable(False, False)
+        win.resizable(True, True)
+        win.minsize(580, 400)
 
         style = ttk.Style(win)
         try:
@@ -889,19 +1462,59 @@ class SettingsWindow:
             pass
         win.option_add("*Font", (FONT_CN, 9))
 
-        self._build(win)
-        self._center(win, 650, 790)
+        self._build_scrollable(win)
+        height = min(880, max(520, win.winfo_screenheight() - 140))
+        self._center(win, 700, height)
         win.protocol("WM_DELETE_WINDOW", self._close)
 
     # ---- 构建界面 ----
 
-    def _build(self, win: tk.Toplevel) -> None:
-        outer = ttk.Frame(win, padding=(18, 14, 18, 12))
-        outer.pack(fill="both", expand=True)
+    def _build_scrollable(self, win: tk.Toplevel) -> None:
+        """内容装进可滚动画布：小屏幕上也能把所有设置项看全。"""
+        canvas = tk.Canvas(
+            win, highlightthickness=0, bd=0, bg=win.cget("background")
+        )
+        bar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
 
+        outer = ttk.Frame(canvas, padding=(18, 14, 18, 12))
+        window_id = canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def sync(_event=None) -> None:
+            if not canvas.winfo_exists():
+                return
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(window_id, width=max(canvas.winfo_width(), 1))
+
+        outer.bind("<Configure>", sync)
+        canvas.bind("<Configure>", sync)
+        # 绑在顶层窗口上，子控件里的滚轮也能转到画布（bindtags 会一路冒上来）
+        win.bind("<MouseWheel>", lambda event: canvas.yview_scroll(
+            -1 if event.delta > 0 else 1, "units"
+        ))
+
+        self._settings_canvas = canvas
+        self._build(outer)
+
+    def _build(self, outer: ttk.Frame) -> None:
         self.engine_var = tk.StringVar(value=self.cfg.get("engine", "baidu"))
         self.hotkey_var = tk.StringVar(value=self.cfg.get("hotkey", "ctrl+alt+t"))
         self.backdrop_var = tk.StringVar(value=self.cfg.get("backdrop", "blur"))
+        self.gradient_labels = backgrounds.preset_labels()
+        self.gradient_var = tk.StringVar(
+            value=backgrounds.preset_label(
+                str(self.cfg.get("backdrop_gradient", backgrounds.DEFAULT_GRADIENT))
+            )
+        )
+        self.image_var = tk.StringVar(value=str(self.cfg.get("backdrop_image", "")))
+        self.image_blur_var = tk.IntVar(
+            value=int(self.cfg.get("backdrop_image_blur", 0) or 0)
+        )
+        self.dim_var = tk.DoubleVar(
+            value=float(self.cfg.get("backdrop_dim", 0.55) or 0.55)
+        )
         self.baidu_appid = tk.StringVar(value=self.cfg["baidu"].get("appid", ""))
         self.baidu_secret = tk.StringVar(value=self.cfg["baidu"].get("secret", ""))
         self.ai_base = tk.StringVar(value=self.cfg["ai"].get("base_url", ""))
@@ -969,6 +1582,47 @@ class SettingsWindow:
             ttk.Radiobutton(
                 backdrop_box, text=label, value=value, variable=self.backdrop_var
             ).pack(side="left", padx=(0, 16))
+        row += 1
+
+        grad_box = ttk.Frame(outer)
+        grad_box.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(grad_box, text="渐变配色").pack(side="left", padx=(22, 6))
+        ttk.Combobox(
+            grad_box, state="readonly", width=14,
+            values=list(self.gradient_labels.keys()),
+            textvariable=self.gradient_var,
+        ).pack(side="left")
+        ttk.Label(
+            grad_box, text="「毛玻璃」模式不用这一项", foreground="#888888"
+        ).pack(side="left", padx=(10, 0))
+        row += 1
+
+        image_box = ttk.Frame(outer)
+        image_box.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(image_box, text="背景图片").pack(side="left", padx=(22, 6))
+        ttk.Entry(image_box, textvariable=self.image_var, width=40).pack(side="left")
+        ttk.Button(image_box, text="浏览…", command=self._pick_image).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(
+            image_box, text="清除", width=6,
+            command=lambda: self.image_var.set(""),
+        ).pack(side="left", padx=(4, 0))
+        row += 1
+
+        tune_box = ttk.Frame(outer)
+        tune_box.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(tune_box, text="图片模糊").pack(side="left", padx=(22, 6))
+        ttk.Spinbox(
+            tune_box, from_=0, to=40, width=4, textvariable=self.image_blur_var
+        ).pack(side="left")
+        ttk.Label(tune_box, text="像素").pack(side="left", padx=(2, 18))
+        ttk.Label(tune_box, text="背景浓度").pack(side="left")
+        ttk.Spinbox(
+            tune_box, from_=0, to=0.95, increment=0.05, width=5,
+            textvariable=self.dim_var,
+        ).pack(side="left", padx=4)
+        ttk.Label(tune_box, text="（0 全透 - 0.95 几乎不透明）").pack(side="left")
         row += 1
 
         bubble_box = ttk.Frame(outer)
@@ -1070,6 +1724,18 @@ class SettingsWindow:
             self.ai_base.set(preset["base_url"])
             self.ai_model.set(preset["model"])
 
+    def _pick_image(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="选择气泡背景图片",
+            filetypes=[
+                ("图片", "*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if path:
+            self.image_var.set(path)
+
     def _record_hotkey(self) -> None:
         """临时挂上键盘钩子，把用户按下的组合键直接填进输入框。"""
         self.hotkey_var.set("请按下组合键…")
@@ -1089,6 +1755,12 @@ class SettingsWindow:
         cfg["engine"] = self.engine_var.get()
         cfg["hotkey"] = self.hotkey_var.get().strip() or "ctrl+alt+t"
         cfg["backdrop"] = self.backdrop_var.get()
+        cfg["backdrop_gradient"] = self.gradient_labels.get(
+            self.gradient_var.get(), backgrounds.DEFAULT_GRADIENT
+        )
+        cfg["backdrop_image"] = self.image_var.get().strip()
+        cfg["backdrop_image_blur"] = max(0, min(40, int(self.image_blur_var.get())))
+        cfg["backdrop_dim"] = max(0.0, min(0.95, float(self.dim_var.get())))
         cfg["bubble_timeout"] = float(self.timeout_var.get())
         cfg["font_size"] = int(self.font_var.get())
         cfg["selection_button"] = bool(self.selection_var.get())
@@ -1106,7 +1778,9 @@ class SettingsWindow:
         try:
             cfg = self._collect()
         except tk.TclError:
-            self._set_status("请检查填写内容：停留时间和字号必须是数字", error=True)
+            self._set_status(
+                "请检查填写内容：停留时间、字号、模糊和背景浓度必须是数字", error=True
+            )
             return
         try:
             self.on_save(cfg)
