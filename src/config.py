@@ -36,6 +36,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "font_size": 11,
     # 选中文字后是否在鼠标旁弹出「翻译」小按钮
     "selection_button": True,
+    # 严格模式：只在确认是文本控件时才弹按钮；Chromium 应用读不到选区，不会弹
+    "selection_button_strict": True,
+    # 严格模式下，浏览器/Electron 无法确认时临时复制一次来检测是否真的有文字
+    "selection_button_precise": True,
     # 模拟复制后等待剪贴板更新的最长时间（秒）
     "capture_timeout": 0.6,
     # 允许翻译的最大字符数，超出则截断（防止一整篇文章糊满屏幕）
@@ -146,6 +150,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def load() -> dict[str, Any]:
     """读取配置。文件缺失或损坏时回退到默认值，并把损坏文件留档备查。"""
+    raw = {}
     path = config_path()
     data: dict[str, Any] = {}
     if path.exists():
@@ -160,7 +165,12 @@ def load() -> dict[str, Any]:
                 shutil.copy2(path, path.with_suffix(".json.broken"))
             except OSError:
                 pass
-    return _deep_merge(DEFAULT_CONFIG, data)
+    merged = _deep_merge(DEFAULT_CONFIG, data)
+    # 「精确检测」是后来才有的。之前关掉严格模式是为了让浏览器里也能弹按钮；
+    # 现在严格模式 + 精确检测已经能正确判断，给老配置重新打开一次。
+    if data and "selection_button_precise" not in data:
+        merged["selection_button_strict"] = True
+    return merged
 
 
 def save(cfg: dict[str, Any]) -> None:

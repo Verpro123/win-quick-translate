@@ -39,6 +39,9 @@ VK_LBUTTON = 0x01
 WM_NCHITTEST = 0x0084
 HTCLIENT = 1
 SMTO_ABORTIFHUNG = 0x0002
+GWL_STYLE = -16
+ES_PASSWORD = 0x0020
+EM_GETPASSWORDCHAR = 0x00D2
 
 # 桌面、任务栏这些地方拖动不是选字，别弹翻译按钮
 _SKIP_CLASSES = {
@@ -79,6 +82,33 @@ _SHELL_VIEW_CLASSES = {
     "SHELLDLL_DefView",
     "DUIViewWndClassName",
     "NamespaceTreeControl",
+}
+
+# 严格模式白名单：这些是最内层"真的能选文字"的控件类名。
+# Chrome / Edge / VS Code / Qoder 等 Chromium 应用默认关闭辅助功能，
+# 系统拿不到它们的选区，只能按"不确定"处理 —— 严格模式下不弹按钮。
+_TEXT_LEAVES = {
+    "Edit",
+    "RichEdit",
+    "RichEdit20A",
+    "RichEdit20W",
+    "RichEdit50W",
+    "RICHEDIT60W",
+    "RichEditD2DPT",
+    "Scintilla",
+    "_WwG",                          # Word 正文
+    "Internet Explorer_Server",
+    "MozillaContentWindowClass",     # Firefox 页面
+    "AVL_AVView",                    # Acrobat / Reader 页面
+}
+
+# 这些是 Chromium/Firefox/IE 的网页渲染控件：系统拿不到选区，
+# 需要靠"临时复制一次"来确认是不是文字。
+_BROWSER_LEAVES = {
+    "Chrome_RenderWidgetHostHWND",
+    "MozillaWindowClass",
+    "MozillaContentWindowClass",
+    "Internet Explorer_Server",
 }
 
 
@@ -135,6 +165,9 @@ user32.SendMessageTimeoutW.restype = ctypes.c_size_t
 
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
+
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
 
 
 # ---------------------------------------------------------------- 屏幕几何
@@ -228,8 +261,34 @@ def chain_is_text_surface(chain: list[str]) -> bool:
     return not any(name in _SHELL_VIEW_CLASSES for name in chain)
 
 
-def point_is_text_surface(x: int, y: int) -> bool:
-    """判断该点是否像"可以选文字"的地方。
+def class_is_confirmed_text(leaf: str) -> bool:
+    """严格模式：只有明确是文本编辑/选择控件的类名才放行。"""
+    return leaf in _TEXT_LEAVES
+
+
+def is_browser_surface(leaf: str) -> bool:
+    """是不是浏览器/Electron 的网页渲染控件（选区对系统不可见）。"""
+    return leaf in _BROWSER_LEAVES
+
+
+def _is_password_field(hwnd: int) -> bool:
+    """原生输入框是不是密码框（密码框不弹划词按钮）。"""
+    try:
+        style = int(user32.GetWindowLongW(wintypes.HWND(hwnd), GWL_STYLE))
+        if style & ES_PASSWORD:
+            return True
+        result = ctypes.c_size_t(0)
+        ok = user32.SendMessageTimeoutW(
+            wintypes.HWND(hwnd), EM_GETPASSWORDCHAR, 0, 0,
+            SMTO_ABORTIFHUNG, 40, ctypes.byref(result),
+        )
+        return bool(ok and result.value)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def text_surface_at(x: int, y: int) -> str | None:
+    """该点像"可选文字"的地方时，返回最内层控件类名；否则返回 None。
 
     先排除资源管理器的文件区（SHELLDLL_DefView）、导航树、任务栏、桌面等
     拖框/拖图标的地方 —— 在这些地方按住左键划一下会选中多个文件/文件夹，
@@ -237,12 +296,13 @@ def point_is_text_surface(x: int, y: int) -> bool:
     再用 WM_NCHITTEST 区分客户区与标题栏 / 边框 / 滚动条。
     """
     try:
-        if not chain_is_text_surface(window_chain(x, y)):
-            return False
+        chain = window_chain(x, y)
+        if not chain_is_text_surface(chain):
+            return None
 
         hwnd = user32.WindowFromPoint(POINT(x, y))
         if not hwnd:
-            return False
+            return None
         target = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
 
         packed = ((y & 0xFFFF) << 16) | (x & 0xFFFF)
@@ -251,12 +311,15 @@ def point_is_text_surface(x: int, y: int) -> bool:
             target, WM_NCHITTEST, 0, packed,
             SMTO_ABORTIFHUNG, 60, ctypes.byref(result),
         )
-        if not ok:
-            return False
-        return int(result.value) == HTCLIENT
+        if not ok or int(result.value) != HTCLIENT:
+            return None
+        leaf = chain[0]
+        if leaf in _TEXT_LEAVES and _is_password_field(int(hwnd)):
+            return None
+        return leaf
     except Exception as exc:  # noqa: BLE001
-        log.debug("命中测试失败（%s），按可划选处理", exc)
-        return True
+        log.debug("命中测试失败（%s），按不可划选处理", exc)
+        return None
 
 
 # ---------------------------------------------------------------- 划词监视
@@ -335,8 +398,13 @@ class SelectionWatcher:
                 if not (dragged or is_double):
                     continue
                 # 起点和终点都得像文字区：从资源管理器文件区拖到别处也不能弹
-                if not point_is_text_surface(*press_pos):
+                press_leaf = text_surface_at(*press_pos)
+                if press_leaf is None:
                     continue
-                if not point_is_text_surface(*release):
+                release_leaf = text_surface_at(*release)
+                if release_leaf is None:
                     continue
-                self._notify(self._on_select, release[0], release[1], press_hwnd)
+                self._notify(
+                    self._on_select, release[0], release[1], press_hwnd,
+                    press_leaf, release_leaf,
+                )

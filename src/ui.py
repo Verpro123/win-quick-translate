@@ -890,7 +890,7 @@ class SettingsWindow:
         win.option_add("*Font", (FONT_CN, 9))
 
         self._build(win)
-        self._center(win, 610, 720)
+        self._center(win, 650, 790)
         win.protocol("WM_DELETE_WINDOW", self._close)
 
     # ---- 构建界面 ----
@@ -911,6 +911,12 @@ class SettingsWindow:
         self.font_var = tk.IntVar(value=int(self.cfg.get("font_size", 11)))
         self.selection_var = tk.BooleanVar(
             value=bool(self.cfg.get("selection_button", True))
+        )
+        self.strict_var = tk.BooleanVar(
+            value=bool(self.cfg.get("selection_button_strict", True))
+        )
+        self.precise_var = tk.BooleanVar(
+            value=bool(self.cfg.get("selection_button_precise", True))
         )
         self.autostart_var = tk.BooleanVar(value=bool(self.cfg.get("autostart", False)))
 
@@ -982,6 +988,33 @@ class SettingsWindow:
             outer, text="选中文字后，在鼠标旁显示「翻译」小按钮",
             variable=self.selection_var,
         ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        row += 1
+
+        ttk.Checkbutton(
+            outer, text="仅在确认是文字控件时显示（严格模式）",
+            variable=self.strict_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=(0, 2))
+        row += 1
+
+        ttk.Label(
+            outer,
+            text="严格模式下原生文本控件直接弹；浏览器/编辑器无法确认时，"
+                 "可勾选下面的精确检测临时复制一次来确认。",
+            foreground="#888888", wraplength=560,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=(0, 4))
+        row += 1
+
+        ttk.Checkbutton(
+            outer, text="精确检测（无法确认时临时复制一次）",
+            variable=self.precise_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=(40, 0), pady=(0, 2))
+        row += 1
+
+        ttk.Label(
+            outer,
+            text="会短暂占用剪贴板并随后还原；选中内容可能进入 Win+V 剪贴板历史。",
+            foreground="#888888", wraplength=560,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=(40, 0), pady=(0, 6))
         row += 1
 
         ttk.Checkbutton(
@@ -1059,6 +1092,8 @@ class SettingsWindow:
         cfg["bubble_timeout"] = float(self.timeout_var.get())
         cfg["font_size"] = int(self.font_var.get())
         cfg["selection_button"] = bool(self.selection_var.get())
+        cfg["selection_button_strict"] = bool(self.strict_var.get())
+        cfg["selection_button_precise"] = bool(self.precise_var.get())
         cfg["autostart"] = bool(self.autostart_var.get())
         cfg["baidu"]["appid"] = self.baidu_appid.get().strip()
         cfg["baidu"]["secret"] = self.baidu_secret.get().strip()

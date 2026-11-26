@@ -18,6 +18,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox
@@ -48,6 +49,8 @@ HELP_TEXT = """使用方法
 · 点击气泡可以立刻关掉它
 · 鼠标停在气泡上的时候，它不会自动消失
 · 气泡会同时显示原文和译文，方便对照
+· 默认严格检测：原生文本控件直接弹；浏览器里会临时复制一次确认，有文字才弹
+· 浏览器里如果没弹按钮，直接按快捷键；也可以在设置里关掉严格模式/精确检测
 · 不想看到划词小按钮，去设置里关掉即可
 
 第一次使用
@@ -73,7 +76,9 @@ class App:
         self.root.title(config_mod.APP_TITLE)
 
         self.bubble = ui.BubbleWindow(self.root, self.cfg)
-        self.prompt = ui.SelectionPrompt(self.root, lambda: self.submit("translate"))
+        self.prompt = ui.SelectionPrompt(
+            self.root, lambda: self.submit("translate_prefetched")
+        )
         self.settings = ui.SettingsWindow(self.root, self.cfg, on_save=self.apply_settings)
         self.hotkeys = system.HotkeyManager(lambda: self.submit("translate"))
         self.tray = tray_mod.TrayIcon(self)
@@ -81,6 +86,10 @@ class App:
             on_select=lambda *pos: self.submit("selection_prompt", pos),
             on_click=lambda x, y: self.submit("mouse_down", (x, y)),
         )
+        # 划词预检测：浏览器类应用用临时复制确认是否真的有文字
+        self._selection_token = 0
+        self._prefetch_text: str | None = None
+        self._prefetch_at = 0.0
 
     # ------------------------------------------------------------ 启动
 
@@ -144,10 +153,17 @@ class App:
             self.bubble.show(source, body, is_error=is_error, auto_hide=auto_hide)
         elif action == "selection_prompt":
             self._show_prompt(*payload)  # type: ignore[misc]
+        elif action == "prefetch_result":
+            self._on_prefetch(*payload)  # type: ignore[misc]
+        elif action == "translate_prefetched":
+            self._start_translate(prefetched=True)
         elif action == "mouse_down":
             x, y = payload  # type: ignore[misc]
             if not self.prompt.hit(x, y):
                 self.prompt.hide()
+                # 用户点别处了，正在跑的预检测结果作废
+                self._selection_token += 1
+                self._prefetch_text = None
         elif action == "settings":
             self.settings.open()
         elif action == "set_engine":
@@ -165,18 +181,31 @@ class App:
 
     # ------------------------------------------------------------ 翻译流程
 
-    def _start_translate(self) -> None:
+    def _start_translate(self, prefetched: bool = False) -> None:
         self.prompt.hide()
         if self._busy:
             log.info("上一次翻译还没结束，忽略这次触发")
             return
+
+        text_override = None
+        if (
+            prefetched
+            and self._prefetch_text
+            and time.monotonic() - self._prefetch_at < 15.0
+        ):
+            text_override = self._prefetch_text
+        self._prefetch_text = None
+
         self._busy = True
         self._token += 1
         threading.Thread(
-            target=self._translate_worker, args=(self._token,), name="translate", daemon=True
+            target=self._translate_worker,
+            args=(self._token, text_override),
+            name="translate",
+            daemon=True,
         ).start()
 
-    def _translate_worker(self, token: int) -> None:
+    def _translate_worker(self, token: int, text_override: str | None = None) -> None:
         try:
             engine = engines.build_engine(self.cfg)
             ok, reason = engine.ready()
@@ -184,18 +213,21 @@ class App:
                 self._bubble("", f"还没配置好翻译引擎：{reason}\n右键托盘图标 → 设置", True)
                 return
 
-            # 取词
-            try:
-                text = capture.grab_selection(
-                    timeout=float(self.cfg.get("capture_timeout", 0.6))
-                )
-            except capture.CaptureError as exc:
-                self._bubble("", str(exc), True)
-                return
-            except Exception as exc:  # noqa: BLE001
-                log.exception("取词异常")
-                self._bubble("", f"取词失败：{exc}", True)
-                return
+            # 取词。点划词按钮时，预检测已经复制过了，直接用缓存，不再复制一次
+            if text_override is not None:
+                text = text_override
+            else:
+                try:
+                    text = capture.grab_selection(
+                        timeout=float(self.cfg.get("capture_timeout", 0.6))
+                    )
+                except capture.CaptureError as exc:
+                    self._bubble("", str(exc), True)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("取词异常")
+                    self._bubble("", f"取词失败：{exc}", True)
+                    return
 
             limit = int(self.cfg.get("max_chars", 1200))
             if len(text) > limit:
@@ -231,7 +263,9 @@ class App:
     def _bubble(self, source: str, body: str, is_error: bool, auto_hide: bool = True) -> None:
         self.queue.put(("bubble", (source, body, is_error, auto_hide)))
 
-    def _show_prompt(self, x: int, y: int, press_hwnd: int) -> None:
+    def _show_prompt(
+        self, x: int, y: int, press_hwnd: int, press_leaf: str, release_leaf: str
+    ) -> None:
         """鼠标划选结束后，在松开的位置旁边放一个「翻译」按钮。"""
         if not self.cfg.get("selection_button", True):
             return
@@ -239,6 +273,54 @@ class App:
         # 用按下时的窗口句柄判断：气泡可能已经被拖到别处了，比坐标可靠。
         if self._is_own_window(press_hwnd):
             return
+
+        self._selection_token += 1
+        token = self._selection_token
+        self._prefetch_text = None
+
+        # 宽松模式：老行为，看到像文字区就弹
+        if not self.cfg.get("selection_button_strict", True):
+            self.prompt.show(x, y)
+            return
+
+        # 严格模式：原生文本控件直接弹；浏览器/Electron 无法确认时，
+        # 异步临时复制一次，能读到文字才弹（豆包/有道用的就是这套兜底）。
+        both_text = (
+            desktop.class_is_confirmed_text(press_leaf)
+            and desktop.class_is_confirmed_text(release_leaf)
+        )
+        if both_text:
+            self.prompt.show(x, y)
+            return
+
+        precise = bool(self.cfg.get("selection_button_precise", True))
+        if precise and desktop.is_browser_surface(press_leaf) and desktop.is_browser_surface(release_leaf):
+            threading.Thread(
+                target=self._prefetch_worker,
+                args=(token, x, y),
+                name="prefetch",
+                daemon=True,
+            ).start()
+
+    def _prefetch_worker(self, token: int, x: int, y: int) -> None:
+        text = None
+        try:
+            timeout = max(0.6, float(self.cfg.get("capture_timeout", 0.6)))
+            text = capture.peek_selection(timeout=timeout)
+        except Exception:  # noqa: BLE001
+            log.exception("划词预检测失败")
+        self.submit("prefetch_result", (token, x, y, text))
+
+    def _on_prefetch(self, token: int, x: int, y: int, text: str | None) -> None:
+        if token != self._selection_token:
+            return  # 期间又有新选择/点击，这次结果作废
+        if not text or not self.cfg.get("selection_button", True):
+            return
+        limit = int(self.cfg.get("max_chars", 1200))
+        if len(text) > limit:
+            text = text[:limit].rstrip() + " …"
+        self._prefetch_text = text
+        self._prefetch_at = time.monotonic()
         self.prompt.show(x, y)
 
     def _is_own_window(self, hwnd: int) -> bool:

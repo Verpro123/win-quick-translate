@@ -111,6 +111,24 @@ def _desktop():
         if desktop.chain_is_text_surface(chain) != expected:
             raise RuntimeError(f"控件过滤判断错误：{chain} 应返回 {expected}")
 
+    for leaf, expected in (
+        ("Edit", True),
+        ("_WwG", True),
+        ("Scintilla", True),
+        ("Chrome_RenderWidgetHostHWND", False),
+        ("TkChild", False),
+    ):
+        if desktop.class_is_confirmed_text(leaf) != expected:
+            raise RuntimeError(f"严格文本判断错误：{leaf} 应返回 {expected}")
+
+    for leaf, expected in (
+        ("Chrome_RenderWidgetHostHWND", True),
+        ("MozillaContentWindowClass", True),
+        ("Edit", False),
+    ):
+        if desktop.is_browser_surface(leaf) != expected:
+            raise RuntimeError(f"浏览器控件判断错误：{leaf} 应返回 {expected}")
+
     return (
         f"鼠标 ({x},{y}) 在当前屏 {right - left}×{bottom - top} 内；"
         f"虚拟屏幕 {vw}×{vh} @ ({vleft},{vtop})；外壳控件过滤正常"

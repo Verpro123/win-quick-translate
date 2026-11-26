@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import threading
 import time
 from ctypes import wintypes
 
@@ -32,8 +33,21 @@ log = logging.getLogger(__name__)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+CF_TEXT = 1
+CF_BITMAP = 2
+CF_METAFILEPICT = 3
+CF_OEMTEXT = 7
+CF_DIB = 8
+CF_PALETTE = 9
 CF_UNICODETEXT = 13
+CF_ENHMETAFILE = 14
+CF_HDROP = 15
+CF_LOCALE = 16
+CF_DIBV5 = 17
 GMEM_MOVEABLE = 0x0002
+
+# 同一次复制可能被划词预检测和翻译流程同时触发，串行化避免互相读到半截
+_COPY_LOCK = threading.Lock()
 
 # ---- 函数签名声明：64 位下不声明会截断指针，必须写全 ----
 user32.OpenClipboard.argtypes = [wintypes.HWND]
@@ -48,6 +62,10 @@ user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
 user32.SetClipboardData.restype = wintypes.HANDLE
 user32.GetClipboardSequenceNumber.argtypes = []
 user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+user32.RegisterClipboardFormatW.restype = wintypes.UINT
 
 kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
@@ -57,6 +75,8 @@ kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
 kernel32.GlobalUnlock.restype = wintypes.BOOL
 kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
 kernel32.GlobalFree.restype = wintypes.HGLOBAL
+kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalSize.restype = ctypes.c_size_t
 
 # 需要提前松开的修饰键
 _MODIFIERS = (
@@ -145,6 +165,115 @@ def clipboard_has_text() -> bool:
     return get_clipboard_text() is not None
 
 
+# ---------------------------------------------------------------- 剪贴板完整备份
+
+
+def _register_format(name: str) -> int:
+    try:
+        return int(user32.RegisterClipboardFormatW(name))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+# 只备份文本类格式。图片/文件等无法安全还原的内容出现时，预检测直接跳过，
+# 宁可这次不弹按钮，也不能把用户的剪贴板弄丢。
+_TEXT_FORMATS = tuple(
+    fmt for fmt in (
+        CF_UNICODETEXT,
+        CF_TEXT,
+        CF_OEMTEXT,
+        CF_LOCALE,
+        _register_format("HTML Format"),
+        _register_format("Rich Text Format"),
+        _register_format("text/html"),
+        _register_format("SourceURL"),
+        _register_format("text/_moz_htmlinfo"),
+        _register_format("text/_moz_htmlcontext"),
+        _register_format("Chromium internal source RFH token"),
+        _register_format("Chromium internal source URL"),
+    )
+    if fmt
+)
+_UNRESTORABLE_FORMATS = (
+    CF_BITMAP, CF_METAFILEPICT, CF_PALETTE, CF_ENHMETAFILE,
+    CF_HDROP, CF_DIB, CF_DIBV5,
+)
+_UNRESTORABLE_NAMES = tuple(
+    fmt for fmt in (
+        _register_format("PNG"),
+        _register_format("image/png"),
+        _register_format("image/jpeg"),
+        _register_format("JFIF"),
+        _register_format("GIF"),
+        _register_format("image/gif"),
+    )
+    if fmt
+)
+
+
+def _clipboard_snapshot() -> dict[int, bytes] | None:
+    """备份文本类剪贴板格式；遇到图片/文件等无法还原的格式时返回 None。"""
+    if not _open_clipboard():
+        return None
+    try:
+        for fmt in _UNRESTORABLE_FORMATS:
+            if user32.IsClipboardFormatAvailable(fmt):
+                return None
+        for fmt in _UNRESTORABLE_NAMES:
+            if user32.IsClipboardFormatAvailable(fmt):
+                return None
+
+        snapshot: dict[int, bytes] = {}
+        for fmt in _TEXT_FORMATS:
+            if not user32.IsClipboardFormatAvailable(fmt):
+                continue
+            handle = user32.GetClipboardData(fmt)
+            if not handle:
+                continue
+            size = int(kernel32.GlobalSize(handle))
+            if size <= 0:
+                continue
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                continue
+            try:
+                snapshot[int(fmt)] = ctypes.string_at(pointer, size)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        return snapshot
+    except Exception as exc:  # noqa: BLE001
+        log.debug("备份剪贴板失败：%s", exc)
+        return None
+    finally:
+        user32.CloseClipboard()
+
+
+def _restore_clipboard(snapshot: dict[int, bytes]) -> None:
+    if not _open_clipboard():
+        log.warning("剪贴板被占用，预检测后没能还原")
+        return
+    try:
+        user32.EmptyClipboard()
+        for fmt, data in snapshot.items():
+            handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, max(1, len(data)))
+            if not handle:
+                continue
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                kernel32.GlobalFree(handle)
+                continue
+            try:
+                ctypes.memmove(pointer, data, len(data))
+            finally:
+                kernel32.GlobalUnlock(handle)
+            if not user32.SetClipboardData(fmt, handle):
+                kernel32.GlobalFree(handle)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("还原剪贴板失败：%s", exc)
+    finally:
+        user32.CloseClipboard()
+
+
 # ---------------------------------------------------------------- 取词
 
 
@@ -178,7 +307,7 @@ def _send_copy() -> None:
         keyboard.release("ctrl")
 
 
-def grab_selection(
+def _grab_selection(
     timeout: float = 0.55,
     poll_interval: float = 0.008,
     settle_before: float = 0.04,
@@ -233,6 +362,82 @@ def grab_selection(
         raise CaptureError("没有取到文字：先选中一段英文再按快捷键")
 
     return text.strip()
+
+
+def _looks_like_password_mask(text: str) -> bool:
+    """浏览器密码框复制出来的是一串圆点/星号，别拿它弹翻译按钮。"""
+    stripped = "".join(text.split())
+    return len(stripped) >= 3 and all(ch in "•●○*" for ch in stripped)
+
+
+def grab_selection(
+    timeout: float = 0.55,
+    poll_interval: float = 0.008,
+    settle_before: float = 0.04,
+    attempts: int = 2,
+) -> str:
+    """把当前选中的文字取回来（和划词预检测串行，避免同时按 Ctrl+C）。"""
+    with _COPY_LOCK:
+        return _grab_selection(timeout, poll_interval, settle_before, attempts)
+
+
+def peek_selection(
+    timeout: float = 0.6,
+    poll_interval: float = 0.008,
+    settle_before: float = 0.04,
+) -> str | None:
+    """临时复制当前选区，读到文字后把剪贴板按格式还原。
+
+    只给划词按钮做"是否选中了文字"的预检测用：
+      · 读不到文字 -> None
+      · 剪贴板里有图片/文件等无法安全还原的内容 -> 直接跳过，返回 None
+    返回的文字可以缓存下来，用户点按钮时不用再复制一次。
+    """
+    with _COPY_LOCK:
+        snapshot = _clipboard_snapshot()
+        if snapshot is None:
+            return None
+
+        keep_restore = True
+        try:
+            _release_modifiers()
+            time.sleep(settle_before)
+            seq_before = clipboard_sequence()
+            try:
+                _send_copy()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("预检测复制失败：%s", exc)
+                return None
+
+            seq_after = None
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                time.sleep(poll_interval)
+                if clipboard_sequence() != seq_before:
+                    seq_after = clipboard_sequence()
+                    break
+            if seq_after is None:
+                return None
+
+            candidate = get_clipboard_text()
+            if candidate is None:
+                for _ in range(6):
+                    time.sleep(0.02)
+                    candidate = get_clipboard_text()
+                    if candidate is not None:
+                        break
+            if candidate is None or not candidate.strip():
+                return None
+            if clipboard_sequence() != seq_after:
+                keep_restore = False
+                return None
+            result = candidate.strip()
+            if _looks_like_password_mask(result):
+                return None
+            return result
+        finally:
+            if keep_restore:
+                _restore_clipboard(snapshot)
 
 
 def _restore(saved_text: str | None, had_text: bool) -> None:
